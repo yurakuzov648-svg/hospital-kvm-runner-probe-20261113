@@ -1,0 +1,406 @@
+name: Ubuntu VM Smoke Test
+"on":
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Boot one offline Ubuntu guest and verify shutdown
+        shell: bash
+        run: |
+          umask 077
+          started=$SECONDS
+          stage=preflight
+          work=
+          finish() {
+            rc=$?
+            trap - EXIT
+            if [[ -n "$work" ]]; then
+              if ! cd /; then
+                stage=leave_workdir
+                rc=1
+              elif ! rm -rf -- "$work" || [[ -e "$work" ]]; then
+                stage=temporary_file_cleanup
+                rc=1
+              fi
+            fi
+            printf 'STAGE=%s EXIT_CODE=%s STEP_SECONDS=%s RESULT=VM_TEST_INCOMPLETE\n' \
+              "$stage" "$rc" "$((SECONDS - started))"
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          . /etc/os-release
+          [[ "$ID:$VERSION_ID:$(uname -m)" == ubuntu:24.04:x86_64 ]]
+          [[ -c /dev/kvm && ! -L /dev/kvm ]]
+          work=$(mktemp -d -- "${RUNNER_TEMP:?}/ubuntu-vm-smoke.XXXXXXXX")
+          cd -- "$work"
+
+          stage=install_packages
+          cat > ubuntu.list <<'APT'
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main universe
+          APT
+          apt_source=(-o "Dir::Etc::sourcelist=$work/ubuntu.list" -o Dir::Etc::sourceparts=-)
+          sudo -n apt-get "${apt_source[@]}" -o APT::Update::Error-Mode=any update
+          packages=(qemu-system-x86 genisoimage ubuntu-keyring)
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]] && ! command -v setfacl >/dev/null; then
+            packages+=(acl)
+          fi
+          sudo -n apt-get "${apt_source[@]}" install -y --no-install-recommends "${packages[@]}"
+          qemu-system-x86_64 --version
+
+          stage=kvm_access
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            sudo -n setfacl -m "u:$(id -u):rw" -- /dev/kvm
+            echo KVM_ACL=applied
+          else
+            echo KVM_ACL=not_needed
+          fi
+          python3 - <<'PY'
+          import fcntl
+          import os
+          fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              version = fcntl.ioctl(fd, 0xAE00, 0)
+              print(f'KVM_API_VERSION={version}')
+              if version != 12:
+                  raise SystemExit(1)
+          finally:
+              os.close(fd)
+          PY
+
+          stage=verify_image
+          base=https://cloud-images.ubuntu.com/releases/noble/release
+          image=ubuntu-24.04-server-cloudimg-amd64.img
+          download() {
+            curl --fail --silent --show-error --proto '=https' \
+              --connect-timeout 15 --max-time "$2" --output "$1" "$base/$1"
+          }
+          download SHA256SUMS 30
+          download SHA256SUMS.gpg 30
+          mkdir -m 0700 gnupg
+          gpgv --homedir "$work/gnupg" \
+            --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg SHA256SUMS.gpg SHA256SUMS
+          awk -v image="$image" '
+            NF==2 && ($2==image || $2=="*" image) &&
+            length($1)==64 && $1 ~ /^[0-9a-f]+$/ { print $1 "  " image; count++ }
+            END { if (count != 1) exit 1 }
+          ' SHA256SUMS > image.sha256
+          download "$image" 180
+          sha256sum --check --strict image.sha256
+          printf 'VERIFIED_IMAGE_SHA256=%s\n' "$(cut -d ' ' -f1 image.sha256)"
+
+          stage=build_seed
+          cat > meta-data <<'SEED'
+          instance-id: iid-ubuntu-vm-smoke
+          local-hostname: ubuntu-smoke
+          SEED
+          printf 'config: disabled\n' > network-config
+          cat > user-data <<'SEED'
+          #cloud-config
+          users: []
+          disable_root: true
+          ssh_pwauth: false
+          package_update: false
+          package_upgrade: false
+          runcmd:
+            - |
+              set -eu
+              . /etc/os-release
+              test "$ID:$VERSION_ID:$(uname -m)" = ubuntu:24.04:x86_64
+              test "$(ls -1 /sys/class/net)" = lo
+              grep -qx 'smoke-ok' <<'PROBE'
+              smoke-ok
+              PROBE
+              printf 'SMOKE_OK ubuntu=%s arch=x86_64 nic=lo uptime_seconds=%s\n' "$VERSION_ID" "$(cut -d' ' -f1 /proc/uptime)" >/dev/ttyS0
+              systemctl poweroff --no-block
+          SEED
+          genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data network-config
+          printf 'PREP_SECONDS=%s VM_VCPU=2 VM_RAM_MIB=2048 ACCEL=kvm\n' "$((SECONDS - started))"
+
+          stage=vm_supervisor
+          exec python3 -u - "$work" "$image" <<'PY'
+          import os
+          import pathlib
+          import re
+          import signal
+          import sys
+          import time
+
+          BUDGET = 720
+          FINALIZATION_RESERVE = 30
+          STOP_REMAINING = 20
+          SERIAL_REMAINING = 13
+          CLEANUP_REMAINING = 2
+          REAP_REMAINING = 1
+          TERM_GRACE = 5
+          POLL_INTERVAL = 0.05
+          BOOT_FAILED = 20
+          INCOMPLETE = 21
+          DEADLINE_EXCEEDED = 22
+          STOP_UNCONFIRMED = 23
+          CANCEL_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+          cancelled = False
+
+
+          def cancel(signum, frame):
+              global cancelled
+              cancelled = True
+
+
+          class Child:
+              """An unreaped direct child owns its PID and isolated process group."""
+
+              def __init__(self, task):
+                  self.rc = None
+                  self.usage = None
+                  self.observed_at = None
+                  self.pid = os.fork()
+                  if self.pid == 0:
+                      try:
+                          os.setsid()
+                          with open(os.devnull, 'r+b', buffering=0) as sink:
+                              for fd in (0, 1, 2):
+                                  os.dup2(sink.fileno(), fd)
+                          code = task()
+                      except OSError as exc:
+                          code = exc.errno if 0 < (exc.errno or 0) < 125 else 125
+                      except BaseException:
+                          code = 125
+                      os._exit(code)
+
+              def poll(self):
+                  if self.rc is None:
+                      pid, status, usage = os.wait4(self.pid, os.WNOHANG)
+                      if pid:
+                          self.observed_at = time.monotonic()
+                          self.rc = os.waitstatus_to_exitcode(status)
+                          self.usage = usage
+                  return self.rc
+
+              def send(self, signum):
+                  # Never signal a reaped PID. Before setsid(), signal the child itself.
+                  if self.rc is not None:
+                      return
+                  try:
+                      os.killpg(self.pid, signum)
+                  except ProcessLookupError:
+                      try:
+                          os.kill(self.pid, signum)
+                      except ProcessLookupError:
+                          pass
+
+
+          def wait_child(child, limit, honor_cancel=False):
+              while time.monotonic() < limit:
+                  if honor_cancel and cancelled:
+                      return None
+                  rc = child.poll()
+                  if rc is not None:
+                      return rc if child.observed_at < limit else None
+                  time.sleep(max(0, min(POLL_INTERVAL, limit - time.monotonic())))
+              return None
+
+
+          def stop_qemu(qemu, limit):
+              try:
+                  qemu.send(signal.SIGTERM)
+                  rc = wait_child(qemu, min(limit, time.monotonic() + TERM_GRACE))
+                  if rc is not None:
+                      return rc
+              except OSError:
+                  pass
+              try:
+                  qemu.send(signal.SIGKILL)
+                  return wait_child(qemu, limit)
+              except (OSError, ChildProcessError):
+                  return None
+
+
+          def verify_serial():
+              with open('serial.log', 'rb') as stream:
+                  data = stream.read(8 * 1024 * 1024 + 1)
+              if len(data) > 8 * 1024 * 1024:
+                  return None
+              marker = rb'SMOKE_OK ubuntu=24\.04 arch=x86_64 nic=lo uptime_seconds=[0-9]+\.[0-9]+'
+              markers = list(re.finditer(rb'(?m)^' + marker + rb'\r?$', data))
+              shutdown = list(re.finditer(rb'(?m)^\[\s*[0-9]+\.[0-9]+\] reboot: Power down\r?$', data))
+              if len(markers) != 1 or len(shutdown) != 1 or shutdown[0].start() <= markers[0].end():
+                  return None
+              evidence = b'\n'.join(match.group().strip() for match in (markers[0], shutdown[0]))
+              return evidence if len(evidence) <= 512 else None
+
+
+          def run_phase(task, cutoff, reap_limit):
+              if time.monotonic() >= cutoff:
+                  return None, True
+              child = Child(task)
+              rc = wait_child(child, cutoff)
+              if rc is not None:
+                  return rc, False
+              if child.rc is None:
+                  child.send(signal.SIGKILL)
+                  wait_child(child, reap_limit)
+              # Late evidence cannot pass the phase, but still confirms reaping.
+              return None, child.rc is not None
+
+
+          def supervise(work, image, started, deadline, log):
+              boot_limit = deadline - FINALIZATION_RESERVE
+              stop_limit = deadline - STOP_REMAINING
+              serial_limit = deadline - SERIAL_REMAINING
+              cleanup_limit = deadline - CLEANUP_REMAINING
+              reap_limit = deadline - REAP_REMAINING
+
+              def boot():
+                  os.chdir(work)
+                  os.execvp('qemu-system-x86_64', [
+                      'qemu-system-x86_64', '-nodefaults', '-machine', 'q35', '-accel', 'kvm',
+                      '-cpu', 'host', '-smp', '2', '-m', '2048', '-nic', 'none', '-display', 'none',
+                      '-monitor', 'none', '-serial', 'file:serial.log', '-no-reboot',
+                      '-drive', f'file={image},if=virtio,format=qcow2',
+                      '-drive', 'file=seed.iso,media=cdrom,format=raw,readonly=on',
+                  ])
+
+              def cleanup():
+                  os.chdir('/')
+                  rc = os.spawnvp(os.P_WAIT, 'rm', ['rm', '-rf', '--', work])
+                  if rc != 0:
+                      return 126
+                  try:
+                      pathlib.Path(work).lstat()
+                  except FileNotFoundError:
+                      return 0
+                  return 126
+
+              code = INCOMPLETE
+              if not cancelled and time.monotonic() < boot_limit:
+                  qemu = Child(boot)
+                  log.append(f'QEMU_PID={qemu.pid} QEMU_SESSION_PGID={qemu.pid}')
+                  try:
+                      qemu_rc = wait_child(qemu, boot_limit, honor_cancel=True)
+                  except (OSError, ChildProcessError):
+                      qemu_rc = None
+                  if qemu_rc is None:
+                      log.append('QEMU_BOOT=not_confirmed_before_cutoff')
+                      if qemu.rc is None:
+                          log.append('QEMU_STOP=requested')
+                          qemu_rc = stop_qemu(qemu, stop_limit)
+                      else:
+                          qemu_rc = qemu.rc if qemu.observed_at < stop_limit else None
+                      if qemu_rc is None:
+                          # One final nonblocking observation distinguishes a
+                          # late reap from a process whose stop is still unknown.
+                          try:
+                              qemu_rc = qemu.poll()
+                          except (OSError, ChildProcessError):
+                              pass
+                          if qemu_rc is None:
+                              log.append('CLEANUP_STATUS=unconfirmed QEMU_REAP=unconfirmed')
+                              return STOP_UNCONFIRMED
+                          log.append('QEMU_STOP_BUDGET=exceeded QEMU_REAP=confirmed_late')
+                          code = STOP_UNCONFIRMED
+                      else:
+                          code = INCOMPLETE if cancelled else BOOT_FAILED
+                  else:
+                      code = 0 if qemu_rc == 0 else BOOT_FAILED
+                  log.append(f'QEMU_EXIT_CODE={qemu_rc} QEMU_REAP=confirmed VM_WALL_SECONDS={time.monotonic() - started:.3f}')
+                  log.append(f'QEMU_PEAK_RSS_KIB={qemu.usage.ru_maxrss}')
+
+              if code == 0 and not cancelled:
+                  read_fd, write_fd = os.pipe()
+                  try:
+                      def serial():
+                          os.chdir(work)
+                          evidence = verify_serial()
+                          if evidence is None:
+                              return BOOT_FAILED
+                          return 0 if os.write(write_fd, evidence) == len(evidence) else INCOMPLETE
+
+                      rc, reaped = run_phase(serial, serial_limit, serial_limit + REAP_REMAINING)
+                      if rc is None:
+                          log.append('VM_DEADLINE=serial_budget_exhausted')
+                          if not reaped:
+                              log.append('CLEANUP_STATUS=unconfirmed')
+                              return DEADLINE_EXCEEDED
+                          code = DEADLINE_EXCEEDED
+                      elif rc != 0:
+                          log.append(f'SERIAL_CHECK_EXIT_CODE={rc}')
+                          code = BOOT_FAILED
+                      else:
+                          # Child is reaped and writes at most 512 bytes. Nonblocking
+                          # read also guards against an unexpected missing message.
+                          os.set_blocking(read_fd, False)
+                          try:
+                              evidence = os.read(read_fd, 512)
+                          except BlockingIOError:
+                              evidence = b''
+                          if evidence:
+                              log.append(evidence.decode('ascii'))
+                          else:
+                              code = BOOT_FAILED
+                  finally:
+                      os.close(write_fd)
+                      os.close(read_fd)
+
+              rc, _ = run_phase(cleanup, cleanup_limit, reap_limit)
+              if rc is None:
+                  log.append('VM_DEADLINE=cleanup_budget_exhausted CLEANUP_STATUS=unconfirmed')
+                  return STOP_UNCONFIRMED if code == STOP_UNCONFIRMED else DEADLINE_EXCEEDED
+              if rc != 0:
+                  log.append(f'CLEANUP_EXIT_CODE={rc} CLEANUP_STATUS=unconfirmed')
+                  return STOP_UNCONFIRMED if code == STOP_UNCONFIRMED else INCOMPLETE
+              log.append('CLEANUP=confirmed')
+              return INCOMPLETE if cancelled and code != STOP_UNCONFIRMED else code
+
+
+          def decide(code, started, deadline):
+              signal.pthread_sigmask(signal.SIG_BLOCK, CANCEL_SIGNALS)
+              # This timestamp is the decision point. The pending check may
+              # conservatively include cancellation immediately after it.
+              decision_at = time.monotonic()
+              pending = signal.sigpending()
+              interrupted = cancelled or bool(pending & CANCEL_SIGNALS)
+              # Preserve the more specific unconfirmed-stop failure at the deadline.
+              if code != STOP_UNCONFIRMED:
+                  if decision_at >= deadline:
+                      code = DEADLINE_EXCEEDED
+                  elif interrupted:
+                      code = INCOMPLETE
+              return code, decision_at - started
+
+
+          def publish(code, elapsed, log):
+              result = {
+                  0: 'VM_BOOT_CONFIRMED',
+                  BOOT_FAILED: 'VM_BOOT_FAILED',
+                  STOP_UNCONFIRMED: 'QEMU_STOP_UNCONFIRMED',
+              }.get(code, 'VM_TEST_INCOMPLETE')
+              if code == DEADLINE_EXCEEDED:
+                  log.append('VM_DEADLINE=exceeded')
+              log.append(f'EXIT_CODE={code} RESULT={result} elapsed_seconds={elapsed!r}')
+              print('\n'.join(log), flush=True)
+
+
+          if __name__ == '__main__':
+              started = time.monotonic()
+              deadline = started + BUDGET
+              for signum in CANCEL_SIGNALS:
+                  signal.signal(signum, cancel)
+              log = []
+              try:
+                  code = supervise(*sys.argv[1:], started, deadline, log)
+              except BaseException:
+                  log.append('STAGE=supervisor ERROR=unhandled')
+                  code = INCOMPLETE
+              code, elapsed = decide(code, started, deadline)
+              publish(code, elapsed, log)
+              sys.exit(code)
+          PY
