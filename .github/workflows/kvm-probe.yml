@@ -1,0 +1,87 @@
+name: KVM Runner Diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  kvm-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Runner and KVM capability
+        shell: bash
+        run: |
+          grep -E '^(ID|VERSION_ID|PRETTY_NAME)=' /etc/os-release
+          printf 'ARCH=%s\nKERNEL=%s\nCPU=%s\nIMAGE_VERSION=%s\n' "$(uname -m)" "$(uname -r)" "$(nproc)" "${ImageVersion:-unknown}"
+          free -h
+          df -hP .
+          printf 'VIRTUALIZATION='
+          systemd-detect-virt || true
+          printf 'CPU_VIRTUALIZATION_FLAGS='
+          grep -Eom1 '\b(vmx|svm)\b' /proc/cpuinfo || true
+          if command -v qemu-system-x86_64; then
+            echo QEMU_PRESENT
+            qemu-system-x86_64 --version
+          else
+            echo QEMU_NOT_PREINSTALLED
+          fi
+          if [[ -e /dev/kvm || -L /dev/kvm ]]; then
+            stat -c 'DEVICE_TYPE=%F OWNER=%U GROUP=%G MODE=%a' /dev/kvm
+          fi
+          access() {
+            if [[ -r /dev/kvm ]]; then echo KVM_READ=yes; else echo KVM_READ=no; fi
+            if [[ -w /dev/kvm ]]; then echo KVM_WRITE=yes; else echo KVM_WRITE=no; fi
+          }
+          probe() {
+            python3 - <<'PY'
+          import errno
+          import fcntl
+          import os
+          import sys
+          try:
+              fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError as exc:
+              print(f"KVM_OPEN_ERRNO={exc.errno}")
+              sys.exit(10 if exc.errno in (errno.EACCES, errno.EPERM) else 11)
+          try:
+              version = fcntl.ioctl(fd, 0xAE00, 0)  # KVM_GET_API_VERSION
+              print(f"KVM_API_VERSION={version}")
+          except OSError as exc:
+              print(f"KVM_IOCTL_ERRNO={exc.errno}")
+              sys.exit(11)
+          finally:
+              os.close(fd)
+          sys.exit(0 if version == 12 else 11)
+          PY
+          }
+          acl=not_attempted
+          if [[ ! -e /dev/kvm && ! -L /dev/kvm ]]; then
+            status=KVM_DEVICE_MISSING
+          elif [[ -L /dev/kvm || ! -c /dev/kvm ]]; then
+            status=KVM_API_FAILED
+          else
+            access
+            rc=0
+            probe || rc=$?
+            if [[ "$rc" == 10 && ( ! -r /dev/kvm || ! -w /dev/kvm ) ]]; then
+              if command -v sudo >/dev/null && command -v setfacl >/dev/null; then
+                if sudo -n setfacl -m "u:$(id -u):rw" -- /dev/kvm; then
+                  acl=applied
+                  access
+                  rc=0
+                  probe || rc=$?
+                else
+                  acl=failed
+                fi
+              else
+                acl=tools_missing
+              fi
+            fi
+            case "$rc" in
+              0) status=KVM_API_ACCESSIBLE ;;
+              10) status=KVM_ACCESS_DENIED ;;
+              11) status=KVM_API_FAILED ;;
+              *) status=RUNNER_DIAGNOSTIC_INCOMPLETE ;;
+            esac
+          fi
+          printf 'ACL=%s\nRESULT=%s\n' "$acl" "$status"
