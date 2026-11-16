@@ -2,6 +2,7 @@ from contextlib import ExitStack
 import os
 import pathlib
 import re
+import secrets
 import select
 import signal
 import stat
@@ -22,6 +23,7 @@ TERM_GRACE = 5
 CLEANUP_TERM_GRACE = 1
 SERIAL_LIMIT = 8 * 1024 * 1024
 SERIAL_CHUNK = 64 * 1024
+RMDIR = '/usr/bin/rmdir' if sys.platform.startswith('linux') else '/bin/rmdir'
 RM = '/usr/bin/rm' if sys.platform.startswith('linux') else '/bin/rm'
 POLL_INTERVAL = 0.05
 BOOT_FAILED = 20
@@ -33,11 +35,14 @@ CLEANUP_UNCONFIRMED = 25
 OWNERSHIP_BLOCKED = 26
 CANCEL_SIGNALS = {signal.SIGTERM, signal.SIGINT}
 cancelled = False
+cancel_signal = None
 
 
 def cancel(signum, frame):
-    global cancelled
+    global cancelled, cancel_signal
     cancelled = True
+    if cancel_signal is None:
+        cancel_signal = signum
 
 
 class Child:
@@ -163,13 +168,42 @@ def directory_fd(path, dir_fd=None):
                    os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
 
 
-def require_safe_parent(parent, fd):
+def checked_directory(path, *, private, dir_fd=None):
+    try:
+        if not os.path.isabs(path) or str(pathlib.Path(path).resolve(strict=True)) != path:
+            raise ControlBlocked('parent_noncanonical_path')
+        entry = os.lstat(path)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise ControlBlocked('parent_invalid_type')
+        name = path if dir_fd is None else os.path.basename(path)
+        fd = directory_fd(name, dir_fd)
+        try:
+            require_directory_identity(path, fd, private)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    except OSError:
+        raise ControlBlocked('parent_access_error') from None
+
+
+def require_directory_identity(path, fd, private):
     info = os.fstat(fd)
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or
-            stat.S_IMODE(info.st_mode) != 0o700 or
-            str(pathlib.Path(parent).resolve(strict=True)) != parent or
-            not os.path.samestat(info, os.lstat(parent))):
-        raise ControlBlocked('unsafe_parent')
+    entry = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or not stat.S_ISDIR(entry.st_mode):
+        raise ControlBlocked('parent_invalid_type')
+    if info.st_uid != os.geteuid():
+        raise ControlBlocked('parent_unexpected_owner')
+    mode = stat.S_IMODE(info.st_mode)
+    if (private and mode != 0o700) or (not private and (mode & 0o7022 or mode & 0o300 != 0o300)):
+        raise ControlBlocked('parent_unsafe_mode')
+    if not os.path.samestat(info, entry):
+        raise ControlBlocked('parent_inode_mismatch')
+    return info
+
+
+def identity_token(info):
+    return f'{info.st_dev}:{info.st_ino}'
 
 
 def mountinfo_point(line):
@@ -208,31 +242,117 @@ def require_no_workspace_mounts(work):
             raise ControlBlocked('unexpected_workspace_mount')
 
 
-def pin_work(work, created_identity, descriptors):
-    runner_temp = os.environ.get('RUNNER_TEMP')
-    if (not os.path.isabs(work) or os.path.normpath(work) != work or
-            not runner_temp or os.path.dirname(work) != runner_temp or
-            not re.fullmatch(r'offline-iso-readiness\.[A-Za-z0-9]{8}', os.path.basename(work))):
+def rollback_empty(base, base_fd, created):
+    for path, identity in reversed(created):
+        if identity is None:
+            return False
+        with ExitStack() as descriptors:
+            fd = checked_directory(path, private=True)
+            descriptors.callback(os.close, fd)
+            require_directory_identity(base, base_fd, private=False)
+            parent, parent_identity = created[0]
+            if (not os.path.samestat(parent_identity, os.lstat(parent)) or
+                    not os.path.samestat(identity, os.fstat(fd))):
+                return False
+            require_no_workspace_mounts(created[0][0])
+            os.rmdir(path)
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                pass
+            else:
+                return False
+            current = os.fstat(fd)
+            if not os.path.samestat(identity, current) or current.st_nlink != 0:
+                return False
+    return True
+
+
+def create_workspace(descriptors, log):
+    base = os.environ.get('RUNNER_TEMP', '')
+    name = 'offline-iso-readiness.' + secrets.token_hex(8)
+    parent = os.path.join(base, name)
+    work = os.path.join(parent, 'vm')
+    created = []
+    base_fd = checked_directory(base, private=False)
+    descriptors.callback(os.close, base_fd)
+    try:
+        for path, owner_fd in ((parent, base_fd), (work, None)):
+            owner_fd = parent_fd if owner_fd is None else owner_fd
+            if cancelled:
+                raise ControlBlocked('workspace_create_cancelled')
+            basename = os.path.basename(path)
+            os.mkdir(basename, 0o700, dir_fd=owner_fd)
+            created.append((path, None))
+            identity = os.stat(basename, dir_fd=owner_fd, follow_symlinks=False)
+            created[-1] = path, identity
+            fd = checked_directory(path, private=True, dir_fd=owner_fd)
+            descriptors.callback(os.close, fd)
+            if not os.path.samestat(identity, os.fstat(fd)):
+                raise ControlBlocked('parent_inode_mismatch')
+            if path == parent:
+                parent_fd, parent_identity = fd, identity
+            require_no_workspace_mounts(parent)
+        if cancelled:
+            raise ControlBlocked('workspace_create_cancelled')
+        return work, (fd, parent_fd, identity, parent_identity, base_fd)
+    except (OSError, ControlBlocked) as exc:
+        try:
+            confirmed = rollback_empty(base, base_fd, created)
+        except (OSError, ControlBlocked):
+            confirmed = False
+        log.append('BOOTSTRAP_ROLLBACK=' + ('confirmed' if confirmed else 'unconfirmed'))
+        if not confirmed:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=bootstrap_rollback')
+        if isinstance(exc, ControlBlocked):
+            raise
+        log.append(f'BOOTSTRAP_ERRNO={exc.errno if isinstance(exc.errno, int) and 0 < exc.errno < 256 else 0}')
+        raise ControlBlocked('workspace_create_error') from None
+
+
+def pin_work(name, parent_token, work_token, descriptors):
+    if not re.fullmatch(r'offline-iso-readiness\.[0-9a-f]{16}', name):
         raise ControlBlocked('unsafe_work_path')
-    parent = os.path.dirname(work)
-    parent_fd = directory_fd(parent)
+    base = os.environ.get('RUNNER_TEMP', '')
+    base_fd = checked_directory(base, private=False)
+    descriptors.callback(os.close, base_fd)
+    parent = os.path.join(base, name)
+    parent_fd = checked_directory(parent, private=True, dir_fd=base_fd)
     descriptors.callback(os.close, parent_fd)
-    require_safe_parent(parent, parent_fd)
-    fd = directory_fd(os.path.basename(work), dir_fd=parent_fd)
+    parent_identity = os.fstat(parent_fd)
+    if identity_token(parent_identity) != parent_token:
+        raise ControlBlocked('parent_inode_mismatch')
+    work = os.path.join(parent, 'vm')
+    fd = checked_directory(work, private=True, dir_fd=parent_fd)
     descriptors.callback(os.close, fd)
     identity = os.fstat(fd)
-    if (identity.st_uid != os.geteuid() or not identity.st_nlink or
-            stat.S_IMODE(identity.st_mode) != 0o700 or
-            f'{identity.st_dev}:{identity.st_ino}' != created_identity or
-            not os.path.samestat(identity, os.lstat(work))):
+    if identity_token(identity) != work_token:
         raise ControlBlocked('unsafe_work_identity')
-    require_no_workspace_mounts(work)
-    return fd, parent_fd, identity
+    require_no_workspace_mounts(parent)
+    return work, (fd, parent_fd, identity, parent_identity, base_fd)
+
+
+def recheck_workspace(work, pinned):
+    fd, parent_fd, identity, parent_identity, base_fd = pinned
+    parent = os.path.dirname(work)
+    base = os.path.dirname(parent)
+    if str(pathlib.Path(parent).resolve(strict=True)) != parent:
+        raise ControlBlocked('parent_noncanonical_path')
+    base_identity = require_directory_identity(base, base_fd, private=False)
+    if not os.path.samestat(parent_identity, require_directory_identity(parent, parent_fd, private=True)):
+        raise ControlBlocked('parent_inode_mismatch')
+    if (not os.path.samestat(identity, os.fstat(fd)) or
+            not os.path.samestat(identity, os.lstat(work))):
+        raise ControlBlocked('work_path_changed')
+    require_no_workspace_mounts(parent)
+    return base_identity
 
 
 def clean_work(work, pinned, cutoff, verify_limit, log):
-    fd, parent_fd, identity = pinned
-    close_fds = (fd, parent_fd)
+    fd, parent_fd, identity, parent_identity, base_fd = pinned
+    parent = os.path.dirname(work)
+    base = os.path.dirname(parent)
+    close_fds = (fd, parent_fd, base_fd)
     run_limit = cutoff - CLEANUP_STOP_RESERVE
     if time.monotonic() >= run_limit:
         log.append('CLEANUP_STATUS=unconfirmed REASON=budget_before_rm')
@@ -240,19 +360,15 @@ def clean_work(work, pinned, cutoff, verify_limit, log):
 
     def remove():
         os.chdir('/')
-        if (not os.path.samestat(parent_identity, os.lstat(os.path.dirname(work))) or
+        if (not os.path.samestat(base_identity, os.lstat(base)) or
+                not os.path.samestat(parent_identity, os.lstat(os.path.dirname(work))) or
                 not os.path.samestat(identity, os.lstat(work))):
             return 126
-        require_no_workspace_mounts(work)
+        require_no_workspace_mounts(parent)
         os.execve(RM, ['rm', '-rf', '--one-file-system', '--', work], {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
 
     try:
-        require_safe_parent(os.path.dirname(work), parent_fd)
-        if (not os.path.samestat(identity, os.fstat(fd)) or
-                not os.path.samestat(identity, os.lstat(work))):
-            raise ControlBlocked('work_path_changed')
-        parent_identity = os.fstat(parent_fd)
-        require_no_workspace_mounts(work)
+        base_identity = recheck_workspace(work, pinned)
         if time.monotonic() >= run_limit:
             log.append('CLEANUP_STATUS=unconfirmed REASON=budget_before_rm')
             return DEADLINE_EXCEEDED
@@ -292,6 +408,56 @@ def clean_work(work, pinned, cutoff, verify_limit, log):
         if time.monotonic() >= cutoff:
             log.append('CLEANUP_STATUS=unconfirmed REASON=identity_check_budget')
             return DEADLINE_EXCEEDED
+
+        def remove_parent():
+            if (not os.path.samestat(base_identity, os.lstat(base)) or
+                    not os.path.samestat(parent_identity, os.lstat(parent))):
+                return 126
+            require_no_workspace_mounts(parent)
+            # The executable itself atomically refuses nonempty directories.
+            os.execve(RMDIR, ['rmdir', '--', parent], {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+
+        # Keep rm's existing cutoffs. An rm that consumes the reserve cannot pass.
+        parent_limit = cutoff - 1.0
+        if time.monotonic() >= parent_limit:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=rmdir_budget_before_start')
+            return DEADLINE_EXCEEDED
+        rmdir = Child(remove_parent, close_fds)
+        try:
+            rc = wait_child(rmdir, parent_limit)
+        except (OSError, ChildProcessError):
+            rc = None
+        if rc is None:
+            if rmdir.rc is None:
+                stop_child(rmdir, cutoff, grace=0.35)
+            reap = 'confirmed' if rmdir.rc is not None else 'unconfirmed'
+            log.append(f'CLEANUP_STATUS=unconfirmed REASON=rmdir_budget RMDIR_REAP={reap}')
+            if rmdir.rc is not None:
+                log.append(f'RMDIR_EXIT_CODE={rmdir.rc}')
+            return DEADLINE_EXCEEDED if rmdir.rc is not None else CLEANUP_UNCONFIRMED
+        log.append(f'RMDIR_EXIT_CODE={rc} RMDIR_REAP=confirmed')
+        if rc != 0:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=parent_remove_error')
+            return INCOMPLETE
+        def verify_parent_absent():
+            try:
+                os.lstat(parent)
+            except FileNotFoundError:
+                return 0
+            return 126
+
+        rc, _ = run_phase(verify_parent_absent, cutoff, verify_limit, close_fds)
+        if rc != 0:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=parent_path_retained')
+            return DEADLINE_EXCEEDED if rc is None else INCOMPLETE
+        current = os.fstat(parent_fd)
+        if not os.path.samestat(parent_identity, current) or current.st_nlink != 0:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=parent_inode_retained')
+            return INCOMPLETE
+        if time.monotonic() >= cutoff:
+            log.append('CLEANUP_STATUS=unconfirmed REASON=identity_check_budget')
+            return DEADLINE_EXCEEDED
+        log.append('WORKSPACE_PARENT_REMOVAL=confirmed')
     except ControlBlocked as exc:
         log.append(f'CLEANUP_STATUS=unconfirmed REASON={exc.args[0]}')
         return OWNERSHIP_BLOCKED
@@ -309,7 +475,7 @@ def supervise(work, iso_hash, files_hash, started, deadline, log, pinned):
     cleanup_limit = deadline - CLEANUP_REMAINING
     reap_limit = deadline - REAP_REMAINING
 
-    close_fds = pinned[:2]
+    close_fds = (*pinned[:2], pinned[4])
 
     code = INCOMPLETE
     overflow = False
@@ -443,10 +609,10 @@ def publish(code, elapsed, log):
     print('\n'.join(log), flush=True)
 
 
-def run(work, iso_hash, files_hash, created_identity, started, deadline, log):
+def run(name, iso_hash, files_hash, parent_token, work_token, started, deadline, log):
     with ExitStack() as descriptors:
         try:
-            pinned = pin_work(work, created_identity, descriptors)
+            work, pinned = pin_work(name, parent_token, work_token, descriptors)
             code = supervise(work, iso_hash, files_hash, started, deadline, log, pinned)
         except ControlBlocked as exc:
             log.append(f'CLEANUP_STATUS=unconfirmed REASON={exc.args[0]}')
@@ -457,26 +623,135 @@ def run(work, iso_hash, files_hash, created_identity, started, deadline, log):
         return decide(code, started, deadline)
 
 
-if __name__ == '__main__':
-    if len(sys.argv) == 3 and sys.argv[1] == '--check-parent':
-        with ExitStack() as descriptors:
-            try:
-                fd = directory_fd(sys.argv[2])
-                descriptors.callback(os.close, fd)
-                require_safe_parent(sys.argv[2], fd)
-            except ControlBlocked as exc:
-                print(f'RESULT=BLOCK REASON={exc.args[0]}')
-                sys.exit(OWNERSHIP_BLOCKED)
-            except OSError:
-                print('RESULT=BLOCK REASON=parent_check_error')
-                sys.exit(OWNERSHIP_BLOCKED)
-        sys.exit(0)
+def prepare_workspace(work, pinned, script, bundle, log):
+    def prepare():
+        os.chdir(work)
+        os.execve('/bin/bash', ['bash', '-c', script, 'prepare', work, bundle], os.environ)
 
+    if cancelled:
+        return 128 + cancel_signal, True
+    # In the parent Child can raise OSError only at fork; after that point
+    # poll/wait errors must follow the unconfirmed-stop path.
+    try:
+        child = Child(prepare, (*pinned[:2], pinned[4]))
+    except OSError as exc:
+        log.append('PREPARATION_FAILURE=fork_failed')
+        number = exc.errno
+        if isinstance(number, int) and 0 < number < 256:
+            log.append(f'PREPARATION_FORK_ERRNO={number}')
+        return INCOMPLETE, True
+    while not cancelled:
+        rc = child.poll()
+        if rc is not None:
+            # A signalled shell cannot attest that foreground preparation ended.
+            return (128 - rc if rc < 0 else rc), rc >= 0
+        time.sleep(POLL_INTERVAL)
+
+    code = 128 + cancel_signal
+    try:
+        # Bash traps run after foreground commands return. Avoid killing those
+        # commands first, so a cooperative shell exit can attest quiescence.
+        if child.rc is None:
+            os.kill(child.pid, cancel_signal)
+        rc = wait_child(child, time.monotonic() + 5)
+        if rc is not None and rc >= 0:
+            return code, True
+    except (OSError, ChildProcessError):
+        pass
+    stop_child(child, time.monotonic() + 2, grace=0.5)
+    log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
+    return code, False
+
+
+PREPARATION_FIELDS = (
+    'QEMU_VERSION', 'KVM_API_VERSION', 'VERIFIED_IMAGE_SHA256',
+    'HOST_ISO_SHA256', 'HOST_FILE_MANIFEST_SHA256',
+)
+PREPARATION_RECEIPT = re.compile(
+    rb'QEMU_VERSION=([0-9]{1,4}(?:\.[0-9]{1,4}){2}(?:-rc[0-9]{1,4})?)\n'
+    rb'KVM_API_VERSION=(12)\n'
+    rb'VERIFIED_IMAGE_SHA256=([0-9a-f]{64})\n'
+    rb'HOST_ISO_SHA256=([0-9a-f]{64})\n'
+    rb'HOST_FILE_MANIFEST_SHA256=([0-9a-f]{64})\n'
+)
+PREPARATION_RECEIPT_LIMIT = 384
+
+
+def read_preparation_receipt(work):
+    fd = os.open(os.path.join(work, 'preparation.receipt'),
+                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ControlBlocked('preparation_receipt_invalid')
+        payload = stream.read(PREPARATION_RECEIPT_LIMIT + 1)
+    match = PREPARATION_RECEIPT.fullmatch(payload)
+    if len(payload) > PREPARATION_RECEIPT_LIMIT or match is None:
+        raise ControlBlocked('preparation_receipt_invalid')
+    return dict(zip(PREPARATION_FIELDS, (value.decode('ascii') for value in match.groups())))
+
+
+def run_workflow(script, bundle, log):
     started = time.monotonic()
-    deadline = started + BUDGET
+    with ExitStack() as descriptors:
+        try:
+            work, pinned = create_workspace(descriptors, log)
+        except (ControlBlocked, OSError) as exc:
+            reason = exc.args[0] if isinstance(exc, ControlBlocked) else 'parent_access_error'
+            log.append(f'RESULT=BLOCK REASON={reason}')
+            code = 128 + cancel_signal if cancelled else OWNERSHIP_BLOCKED
+            return code, time.monotonic() - started
+
+        try:
+            code, stopped = prepare_workspace(work, pinned, script, bundle, log)
+        except (OSError, ChildProcessError):
+            log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_supervision')
+            return INCOMPLETE, time.monotonic() - started
+        if not stopped:
+            if not cancelled:
+                log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
+            return code, time.monotonic() - started
+        if cancelled and code == 0:
+            code = 128 + cancel_signal
+        if code == 0:
+            try:
+                evidence = read_preparation_receipt(work)
+            except (ControlBlocked, OSError):
+                log.append('PREPARATION_FAILURE=receipt_invalid')
+                code = INCOMPLETE
+        if code == 0:
+            try:
+                recheck_workspace(work, pinned)
+            except (ControlBlocked, OSError):
+                log.append('PREPARATION_FAILURE=workspace_recheck')
+                code = OWNERSHIP_BLOCKED
+        if cancelled and code == 0:
+            code = 128 + cancel_signal
+        if code != 0:
+            log.append(f'PREPARATION_EXIT_CODE={code}')
+            cutoff = time.monotonic() + 10
+            rollback = clean_work(work, pinned, cutoff, cutoff + REAP_REMAINING, log)
+            log.append('PREPARATION_ROLLBACK=' + ('confirmed' if rollback == 0 else 'unconfirmed'))
+            return code, time.monotonic() - started
+
+        log.extend(f'{key}={evidence[key]}' for key in PREPARATION_FIELDS)
+        log.append(f'PREP_SECONDS={time.monotonic() - started:.3f}')
+        started = time.monotonic()
+        deadline = started + BUDGET
+        code = supervise(work, evidence['HOST_ISO_SHA256'], evidence['HOST_FILE_MANIFEST_SHA256'],
+                         started, deadline, log, pinned)
+        return decide(code, started, deadline)
+
+
+if __name__ == '__main__':
     for signum in CANCEL_SIGNALS:
         signal.signal(signum, cancel)
     log = []
-    code, elapsed = run(*sys.argv[1:], started, deadline, log)
+    try:
+        if sys.argv[1:] != ['--prepare-and-run']:
+            raise ValueError('invalid invocation')
+        code, elapsed = run_workflow(sys.stdin.read(), str(pathlib.Path(__file__).resolve().parent), log)
+    except (OSError, ValueError, ControlBlocked):
+        log.append('CLEANUP_STATUS=unconfirmed REASON=supervision_error')
+        code, elapsed = INCOMPLETE, 0
     publish(code, elapsed, log)
     sys.exit(code)

@@ -26,7 +26,9 @@ def birth(work):
 
 
 def fixture_work(parent):
-    work = Path(parent).resolve() / 'offline-iso-readiness.1234abcd'
+    parent = Path(parent).resolve() / 'offline-iso-readiness.1234abcd1234abcd'
+    parent.mkdir(mode=0o700)
+    work = parent / 'vm'
     work.mkdir(mode=0o700)
     return work
 
@@ -101,14 +103,14 @@ class Readiness(unittest.TestCase):
             fake.write_text(f'#!{sys.executable}\n' +
                             (producer or f'import os\nos.write(1, {data!r})\n'))
             fake.chmod(0o700)
-            rm = fixture_rm(work.parent, rm_body)
+            rm = fixture_rm(work.parent.parent, rm_body)
             code = f'''
 import os
 import time
 import supervisor
 supervisor.qemu_args = lambda: [{str(fake)!r}]
 supervisor.verify_launch = lambda args: None
-os.environ['RUNNER_TEMP'] = {str(work.parent)!r}
+os.environ['RUNNER_TEMP'] = {str(work.parent.parent)!r}
 if supervisor.sys.platform == 'darwin':
     supervisor.require_no_workspace_mounts = lambda work: None
 if supervisor.sys.platform == 'darwin':
@@ -117,10 +119,10 @@ if supervisor.sys.platform == 'darwin':
     from types import SimpleNamespace
     original_fstat = os.fstat
     work = Path({str(work)!r})
-    identity = work.stat()
+    identities = [(path, path.stat()) for path in (work, work.parent)]
     def linux_unlink_result(fd):
         info = original_fstat(fd)
-        if os.path.samestat(info, identity) and not work.exists():
+        if any(os.path.samestat(info, identity) and not path.exists() for path, identity in identities):
             return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=0)
         return info
     supervisor.os.fstat = linux_unlink_result
@@ -142,7 +144,7 @@ if {fault!r} == 'deadline':
     supervisor.time.monotonic = lambda: 1200
 log = []
 started = 0 if {fault!r} == 'deadline' else time.monotonic()
-rc, elapsed = supervisor.run({str(work)!r}, {sha(b'iso')!r}, {FILES_HASH!r}, {birth(work)!r},
+rc, elapsed = supervisor.run({work.parent.name!r}, {sha(b'iso')!r}, {FILES_HASH!r}, {birth(work.parent)!r}, {birth(work)!r},
                           started, started + (1.5 if {fault!r} == 'rm_hang' else 1200), log)
 supervisor.publish(rc, elapsed, log)
 raise SystemExit(rc)
@@ -228,9 +230,9 @@ while True:
             child.return_value.rc = None
             log = []
             work = fixture_work(tmp)
-            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent)), \
+            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent.parent)), \
                     patch.object(supervisor, 'require_no_workspace_mounts'):
-                pinned = supervisor.pin_work(str(work), birth(work), descriptors)
+                _, pinned = supervisor.pin_work(work.parent.name, birth(work.parent), birth(work), descriptors)
                 rc = supervisor.clean_work(str(work), pinned, supervisor.time.monotonic() + 10,
                                            supervisor.time.monotonic() + 11, log)
             stop.assert_called_once()
@@ -244,9 +246,9 @@ while True:
             child.return_value.rc = 0
             log = []
             work = fixture_work(tmp)
-            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent)), \
+            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent.parent)), \
                     patch.object(supervisor, 'require_no_workspace_mounts'):
-                pinned = supervisor.pin_work(str(work), birth(work), descriptors)
+                _, pinned = supervisor.pin_work(work.parent.name, birth(work.parent), birth(work), descriptors)
                 rc = supervisor.clean_work(str(work), pinned, supervisor.time.monotonic() + 10,
                                            supervisor.time.monotonic() + 11, log)
             self.assertEqual(rc, 22)
@@ -279,9 +281,9 @@ while True:
             child.return_value.poll.return_value = None
             start = supervisor.time.monotonic()
             work = fixture_work(tmp)
-            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent)), \
+            with ExitStack() as descriptors, patch.dict(os.environ, RUNNER_TEMP=str(work.parent.parent)), \
                     patch.object(supervisor, 'require_no_workspace_mounts'):
-                pinned = supervisor.pin_work(str(work), birth(work), descriptors)
+                _, pinned = supervisor.pin_work(work.parent.name, birth(work.parent), birth(work), descriptors)
                 self.assertEqual(supervisor.supervise(str(work), ISO, FILES_HASH, start, start + 1200, [], pinned), 23)
             self.assertTrue(work.exists())
 
@@ -293,6 +295,7 @@ class CleanupIdentity(unittest.TestCase):
         self.parent = Path(base.name).resolve()
         self.work = fixture_work(self.parent)
         self.created_identity = birth(self.work)
+        self.parent_identity = birth(self.work.parent)
         self.renamed = self.parent / 'original'
         self.log = []
         self.descriptors = ExitStack()
@@ -301,7 +304,11 @@ class CleanupIdentity(unittest.TestCase):
         self.descriptors.enter_context(patch.object(supervisor, 'RM', fixture_rm(self.parent)))
         if sys.platform == 'darwin':
             self.descriptors.enter_context(patch.object(supervisor, 'require_no_workspace_mounts'))
-        self.pinned = supervisor.pin_work(str(self.work), self.created_identity, self.descriptors)
+        _, self.pinned = self.pin(self.descriptors)
+
+    def pin(self, descriptors):
+        return supervisor.pin_work(self.work.parent.name, self.parent_identity,
+                                   self.created_identity, descriptors)
 
     def clean(self):
         cutoff = supervisor.time.monotonic() + 10
@@ -320,7 +327,8 @@ class CleanupIdentity(unittest.TestCase):
 
         def fstat(fd):
             info = real_fstat(fd)
-            if fd == self.pinned[0] and not self.work.exists():
+            if (fd == self.pinned[0] and not self.work.exists() or
+                    fd == self.pinned[1] and not self.work.parent.exists()):
                 observed.append(info.st_nlink)
                 if sys.platform == 'darwin':
                     # Darwin keeps directory link counts after rmdir with an open fd.
@@ -329,9 +337,11 @@ class CleanupIdentity(unittest.TestCase):
 
         with patch.object(supervisor.os, 'fstat', side_effect=fstat):
             self.assertEqual(self.clean(), 0, self.log)
-        self.assertEqual(len(observed), 1)
+        self.assertFalse(self.work.parent.exists())
+        self.assertIn('WORKSPACE_PARENT_REMOVAL=confirmed', self.log)
+        self.assertEqual(len(observed), 2)
         if sys.platform != 'darwin':
-            self.assertEqual(observed, [0])
+            self.assertEqual(observed, [0, 0])
         self.assertFalse(self.work.exists())
 
     def test_rename_before_rm(self):
@@ -367,31 +377,31 @@ class CleanupIdentity(unittest.TestCase):
         self.work.mkdir(mode=0o700)
         with ExitStack() as stack, patch.object(supervisor, 'Child') as child:
             with self.assertRaisesRegex(supervisor.ControlBlocked, 'unsafe_work_identity'):
-                supervisor.pin_work(str(self.work), self.created_identity, stack)
+                self.pin(stack)
         child.assert_not_called()
         self.assertTrue(self.work.exists())
 
-    def test_cli_preflight_passes_without_creating_resources(self):
-        self.descriptors.close()
-        before = sorted(self.parent.iterdir())
-        result = subprocess.run(
-            [sys.executable, '-B', str(ROOT / 'supervisor.py'), '--check-parent', str(self.parent)],
-            capture_output=True, text=True, timeout=5)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, '')
-        self.assertEqual(sorted(self.parent.iterdir()), before)
+    def test_preflight_creates_private_workspace_under_0755_base(self):
+        self.parent.chmod(0o755)
+        with ExitStack() as stack:
+            work, pinned = supervisor.create_workspace(stack, [])
+            private = Path(work).parent
+            self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(Path(work).stat().st_mode & 0o777, 0o700)
+            self.assertEqual(self.parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(os.fstat(pinned[0]).st_ino, Path(work).stat().st_ino)
 
     def test_unsafe_parent_mode_blocks_cleanup(self):
         self.parent.chmod(0o770)
         with ExitStack() as stack:
-            with self.assertRaisesRegex(supervisor.ControlBlocked, 'unsafe_parent'):
-                supervisor.pin_work(str(self.work), self.created_identity, stack)
+            with self.assertRaisesRegex(supervisor.ControlBlocked, 'parent_unsafe_mode'):
+                self.pin(stack)
 
     def test_symlink_work_and_parent_are_rejected(self):
         self.work.rename(self.renamed)
         self.work.symlink_to(self.renamed, target_is_directory=True)
-        with ExitStack() as stack, self.assertRaises(OSError):
-            supervisor.pin_work(str(self.work), self.created_identity, stack)
+        with ExitStack() as stack, self.assertRaisesRegex(supervisor.ControlBlocked, 'parent_noncanonical_path'):
+            self.pin(stack)
         with patch.object(supervisor, 'Child') as child:
             self.assertNotEqual(self.clean(), 0)
         child.assert_not_called()
@@ -403,26 +413,368 @@ class CleanupIdentity(unittest.TestCase):
         nested = self.parent / 'nested'
         nested.mkdir(mode=0o700)
         redirected = str(alias / 'nested')
-        fd = supervisor.directory_fd(redirected)
-        self.addCleanup(os.close, fd)
-        with self.assertRaisesRegex(supervisor.ControlBlocked, 'unsafe_parent'):
-            supervisor.require_safe_parent(redirected, fd)
+        with self.assertRaisesRegex(supervisor.ControlBlocked, 'parent_noncanonical_path'):
+            supervisor.checked_directory(redirected, private=True)
 
     def test_workspace_must_be_generated_direct_child(self):
         for path in (self.parent / 'other', self.parent / 'nested' / self.work.name):
             with self.subTest(path=path.name), ExitStack() as stack, \
                     self.assertRaisesRegex(supervisor.ControlBlocked, 'unsafe_work_path'):
-                supervisor.pin_work(str(path), self.created_identity, stack)
+                supervisor.pin_work(str(path), self.parent_identity, self.created_identity, stack)
 
     def test_mount_inventory_blocks_vm_and_cleanup(self):
         with patch.object(supervisor, 'require_no_workspace_mounts',
                           side_effect=supervisor.ControlBlocked('unexpected_workspace_mount')), \
                 patch.object(supervisor, 'Child') as child:
             with ExitStack() as stack, self.assertRaisesRegex(supervisor.ControlBlocked, 'unexpected_workspace_mount'):
-                supervisor.pin_work(str(self.work), self.created_identity, stack)
+                self.pin(stack)
             self.assertEqual(self.clean(), supervisor.OWNERSHIP_BLOCKED)
         child.assert_not_called()
         self.assertTrue(self.work.exists())
+
+    def test_parent_diagnostics_are_fixed(self):
+        plain = self.parent / 'file'
+        plain.touch()
+        with self.assertRaisesRegex(supervisor.ControlBlocked, '^parent_invalid_type$'):
+            supervisor.checked_directory(str(plain), private=False)
+        with patch.object(supervisor.os, 'geteuid', return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(supervisor.ControlBlocked, '^parent_unexpected_owner$'):
+                supervisor.checked_directory(str(self.parent), private=False)
+        with patch.object(supervisor, 'directory_fd', side_effect=PermissionError(errno.EACCES, 'fixture text')):
+            with self.assertRaisesRegex(supervisor.ControlBlocked, '^parent_access_error$'):
+                supervisor.checked_directory(str(self.parent), private=False)
+
+    def test_replaced_private_parent_is_rejected(self):
+        self.work.parent.rename(self.renamed)
+        self.work.parent.mkdir(mode=0o700)
+        self.work.mkdir(mode=0o700)
+        with ExitStack() as stack, self.assertRaisesRegex(supervisor.ControlBlocked, 'parent_inode_mismatch'):
+            self.pin(stack)
+        with patch.object(supervisor, 'Child') as child:
+            self.assertEqual(self.clean(), supervisor.OWNERSHIP_BLOCKED)
+        child.assert_not_called()
+        self.assertTrue(self.work.is_dir())
+
+    def test_workspace_creation_error_is_classified(self):
+        real_mkdir = os.mkdir
+
+        def mkdir(name, *args, **kwargs):
+            if name == 'vm':
+                raise OSError(errno.EIO, 'synthetic untrusted text')
+            return real_mkdir(name, *args, **kwargs)
+
+        before = set(self.parent.iterdir())
+        log = []
+        with self.linux_links(), ExitStack() as stack, patch.object(supervisor.os, 'mkdir', side_effect=mkdir):
+            with self.assertRaisesRegex(supervisor.ControlBlocked, '^workspace_create_error$'):
+                supervisor.create_workspace(stack, log)
+        self.assertEqual(set(self.parent.iterdir()), before)
+        self.assertIn('BOOTSTRAP_ROLLBACK=confirmed', log)
+        self.assertIn(f'BOOTSTRAP_ERRNO={errno.EIO}', log)
+
+    def linux_links(self):
+        # Darwin retains nonzero link counts for unlinked open directories.
+        # Model Linux only after the known path actually disappears.
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        if sys.platform != 'darwin':
+            return nullcontext()
+        real_fstat = os.fstat
+        checked = supervisor.checked_directory
+        paths = {birth(self.work): self.work, birth(self.work.parent): self.work.parent}
+        stack = ExitStack()
+
+        def remember(path, **kwargs):
+            fd = checked(path, **kwargs)
+            paths[supervisor.identity_token(real_fstat(fd))] = Path(path)
+            return fd
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            path = paths.get(supervisor.identity_token(info))
+            if path is not None and not path.exists():
+                return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=0)
+            return info
+
+        stack.enter_context(patch.object(supervisor, 'checked_directory', side_effect=remember))
+        stack.enter_context(patch.object(supervisor.os, 'fstat', side_effect=fstat))
+        return stack
+
+    def test_bootstrap_rolls_back_after_work_is_created(self):
+        before = set(self.parent.iterdir())
+        log = []
+        actual = self.work.name
+        checked = supervisor.checked_directory
+        calls = []
+
+        def fail_once(path, **kwargs):
+            fd = checked(path, **kwargs)
+            if Path(path).name == actual and not calls:
+                calls.append(path)
+                os.close(fd)
+                raise OSError(errno.EIO)
+            return fd
+
+        # Record the work identity when rollback reopens the known inode.
+        with patch.object(supervisor, 'checked_directory', side_effect=fail_once):
+            with self.linux_links(), ExitStack() as stack:
+                with self.assertRaisesRegex(supervisor.ControlBlocked, '^workspace_create_error$'):
+                    supervisor.create_workspace(stack, log)
+        self.assertEqual(set(self.parent.iterdir()), before)
+        self.assertIn('BOOTSTRAP_ROLLBACK=confirmed', log)
+
+    @staticmethod
+    def preparation_fields():
+        return {
+            'QEMU_VERSION': '8.2.2',
+            'KVM_API_VERSION': '12',
+            'VERIFIED_IMAGE_SHA256': 'a' * 64,
+            'HOST_ISO_SHA256': 'b' * 64,
+            'HOST_FILE_MANIFEST_SHA256': 'c' * 64,
+        }
+
+    @staticmethod
+    def write_receipt(fields, target='preparation.receipt', extra=''):
+        import shlex
+        payload = ''.join(f'{key}={value}\n' for key, value in fields.items()) + extra
+        return f'printf %s {shlex.quote(payload)} > {target}'
+
+    def test_preparation_fork_failure_rolls_back_or_reports_unconfirmed(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent), self.linux_links():
+                before = set(self.parent.iterdir())
+                original_fork = os.fork
+                attempts = []
+                log = []
+
+                def fork():
+                    attempts.append(1)
+                    if len(attempts) == 1 or persistent:
+                        self.assertEqual(len(set(self.parent.iterdir()) - before), 1)
+                        raise OSError(errno.EAGAIN, 'synthetic secret')
+                    return original_fork()
+
+                sentinel = self.parent / 'unexpected-bash'
+                with patch.object(supervisor.os, 'fork', side_effect=fork), \
+                        patch.object(supervisor, 'supervise') as boot:
+                    code, _ = supervisor.run_workflow(f'touch "{sentinel}"', str(ROOT), log)
+                self.assertEqual(code, supervisor.INCOMPLETE, log)
+                self.assertFalse(sentinel.exists())
+                boot.assert_not_called()
+                self.assertIn('PREPARATION_FAILURE=fork_failed', log)
+                self.assertIn(f'PREPARATION_FORK_ERRNO={errno.EAGAIN}', log)
+                self.assertIn(f'PREPARATION_EXIT_CODE={supervisor.INCOMPLETE}', log)
+                self.assertNotIn('synthetic secret', '\n'.join(log))
+                if persistent:
+                    self.assertIn('PREPARATION_ROLLBACK=unconfirmed', log)
+                    parent, = set(self.parent.iterdir()) - before
+                    self.assertTrue((parent / 'vm').is_dir())
+                else:
+                    self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+                    self.assertEqual(set(self.parent.iterdir()), before)
+
+    def test_preparation_poll_error_does_not_roll_back(self):
+        before = set(self.parent.iterdir())
+        log = []
+        with patch.object(supervisor, 'Child') as child, patch.object(supervisor, 'clean_work') as cleanup, \
+                patch.object(supervisor, 'supervise') as boot:
+            child.return_value.poll.side_effect = OSError(errno.EIO, 'raw diagnostic')
+            code, _ = supervisor.run_workflow('', str(ROOT), log)
+        self.assertEqual(code, supervisor.INCOMPLETE)
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=preparation_supervision', log)
+        self.assertNotIn('raw diagnostic', '\n'.join(log))
+        child.assert_called_once()
+        cleanup.assert_not_called()
+        boot.assert_not_called()
+        parent, = set(self.parent.iterdir()) - before
+        self.assertTrue((parent / 'vm').is_dir())
+
+    def test_receipt_publishes_all_five_values_with_mock_vm(self):
+        import contextlib
+        import io
+        evidence = self.preparation_fields()
+        before = set(self.parent.iterdir())
+        log = []
+        out = io.StringIO()
+        script = 'echo SYNTHETIC_RAW_OUTPUT; echo SYNTHETIC_RAW_ERROR >&2; ' + self.write_receipt(evidence)
+        with self.linux_links(), patch.object(supervisor, 'decide', side_effect=lambda code, *_: (code, 1.0)), \
+                patch.object(supervisor, 'supervise', side_effect=self.clean_mock_vm) as boot, \
+                contextlib.redirect_stdout(out):
+            code, elapsed = supervisor.run_workflow(script, str(ROOT), log)
+            supervisor.publish(code, elapsed, log)
+        self.assertEqual(code, 0, log)
+        self.assertEqual(boot.call_args.args[1:3], (evidence['HOST_ISO_SHA256'], evidence['HOST_FILE_MANIFEST_SHA256']))
+        self.assertEqual(set(self.parent.iterdir()), before)
+        for key, value in evidence.items():
+            self.assertIn(f'{key}={value}', out.getvalue().splitlines())
+        self.assertNotIn('SYNTHETIC_RAW', out.getvalue())
+
+    def clean_mock_vm(self, work, iso_hash, files_hash, started, deadline, log, pinned):
+        return supervisor.clean_work(work, pinned, deadline - 2, deadline - 1, log)
+
+    def test_receipt_rejects_missing_invalid_and_injected_fields(self):
+        evidence = self.preparation_fields()
+        cases = []
+        for key, invalid in (('QEMU_VERSION', '8.2.2 unexpected'), ('KVM_API_VERSION', '13'),
+                             ('VERIFIED_IMAGE_SHA256', 'A' * 64)):
+            cases.append(({k: v for k, v in evidence.items() if k != key}, ''))
+            cases.append(({**evidence, key: invalid}, ''))
+        cases.append((evidence, 'SYNTHETIC_INJECTED=secret\n'))
+        cases.append((evidence, 'X' * supervisor.PREPARATION_RECEIPT_LIMIT))
+        for fields, extra in cases:
+            with self.subTest(fields=list(fields), extra=bool(extra)), self.linux_links(), \
+                    patch.object(supervisor, 'supervise') as boot:
+                before = set(self.parent.iterdir())
+                log = []
+                code, _ = supervisor.run_workflow(self.write_receipt(fields, extra=extra), str(ROOT), log)
+                self.assertEqual(code, supervisor.INCOMPLETE, log)
+                self.assertIn('PREPARATION_FAILURE=receipt_invalid', log)
+                self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+                self.assertFalse(any(line.startswith(tuple(evidence)) for line in log))
+                self.assertNotIn('SYNTHETIC_INJECTED', '\n'.join(log))
+                self.assertEqual(set(self.parent.iterdir()), before)
+                boot.assert_not_called()
+
+    def test_preparation_failures_roll_back_and_preserve_codes(self):
+        for script, expected in (('exit 37', 37), ('touch synthetic-media; exit 38', 38),
+                                 ('printf invalid > preparation.receipt', supervisor.INCOMPLETE)):
+            with self.subTest(script=script), self.linux_links(), patch.object(supervisor, 'supervise') as boot:
+                before = set(self.parent.iterdir())
+                log = []
+                code, _ = supervisor.run_workflow(script, str(ROOT), log)
+                self.assertEqual(code, expected, log)
+                self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+                self.assertEqual(set(self.parent.iterdir()), before)
+                boot.assert_not_called()
+
+    def test_workspace_changed_during_preparation_blocks_boot(self):
+        before = set(self.parent.iterdir())
+        log = []
+        script = (
+            'cd ..; mv vm detached; mkdir -m 700 vm; '
+            + self.write_receipt(self.preparation_fields(), 'vm/preparation.receipt')
+        )
+        with patch.object(supervisor, 'supervise') as boot:
+            code, _ = supervisor.run_workflow(script, str(ROOT), log)
+        self.assertEqual(code, supervisor.OWNERSHIP_BLOCKED)
+        self.assertIn('PREPARATION_FAILURE=workspace_recheck', log)
+        self.assertIn('PREPARATION_ROLLBACK=unconfirmed', log)
+        boot.assert_not_called()
+        parent, = set(self.parent.iterdir()) - before
+        self.assertTrue((parent / 'vm').is_dir())
+        self.assertTrue((parent / 'detached').is_dir())
+
+    def test_preparation_handles_real_int_and_term(self):
+        import signal
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum), self.linux_links(), \
+                    patch.object(supervisor, 'cancelled', False), \
+                    patch.object(supervisor, 'cancel_signal', None), \
+                    patch.object(supervisor, 'supervise') as boot:
+                before = set(self.parent.iterdir())
+                old = signal.signal(signum, supervisor.cancel)
+                try:
+                    number = int(signum)
+                    script = (f"trap 'exit {128 + number}' {number}; "
+                              f'touch synthetic-media; kill -{number} "$PPID"; sleep 0.2')
+                    log = []
+                    code, _ = supervisor.run_workflow(script, str(ROOT), log)
+                finally:
+                    signal.signal(signum, old)
+                self.assertEqual(code, 128 + number, log)
+                self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+                self.assertEqual(set(self.parent.iterdir()), before)
+                boot.assert_not_called()
+
+    def test_unconfirmed_preparation_leaves_workspace(self):
+        before = set(self.parent.iterdir())
+        log = []
+        with patch.object(supervisor, 'prepare_workspace', return_value=(143, False)), \
+                patch.object(supervisor, 'clean_work') as cleanup:
+            code, _ = supervisor.run_workflow('', str(ROOT), log)
+        self.assertEqual(code, 143)
+        self.assertEqual(len(set(self.parent.iterdir()) - before), 1)
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=preparation_stop', log)
+        cleanup.assert_not_called()
+
+    def test_rmdir_absent_and_nonzero_exit_fail(self):
+        for program, code in ((str(self.parent / 'missing-rmdir'), 2), ('/usr/bin/false', 1)):
+            with self.subTest(program=program), self.linux_links(), patch.object(supervisor, 'RMDIR', program):
+                self.assertEqual(self.clean(), supervisor.INCOMPLETE)
+                self.assertIn(f'RMDIR_EXIT_CODE={code} RMDIR_REAP=confirmed', self.log)
+                self.assertTrue(self.work.parent.exists())
+            if not self.work.exists():
+                self.work.mkdir(mode=0o700)
+                self.pin_replacement_fixture()
+
+    def pin_replacement_fixture(self):
+        self.created_identity = birth(self.work)
+        _, self.pinned = self.pin(self.descriptors)
+
+    def test_rmdir_zero_without_removal_is_rejected(self):
+        with self.linux_links(), patch.object(supervisor, 'RMDIR', '/usr/bin/true'):
+            self.assertEqual(self.clean(), supervisor.INCOMPLETE)
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=parent_path_retained', self.log)
+
+    def test_rmdir_hang_is_killed_and_reaped(self):
+        rm = self.parent / 'hung-rmdir'
+        rm.write_text(f'#!{sys.executable}\nimport signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n')
+        rm.chmod(0o700)
+        cutoff = supervisor.time.monotonic() + 2
+        with self.linux_links(), patch.object(supervisor, 'RMDIR', str(rm)), \
+                patch.object(supervisor, 'CLEANUP_STOP_RESERVE', 1.5):
+            self.assertEqual(supervisor.clean_work(str(self.work), self.pinned, cutoff, cutoff + 1,
+                                                   self.log), supervisor.DEADLINE_EXCEEDED)
+        self.assertIn('RMDIR_EXIT_CODE=-9', self.log)
+        self.assertTrue(self.work.parent.exists())
+
+    def test_rmdir_late_and_unconfirmed_wait4_fail(self):
+        from unittest.mock import Mock
+        for rc, expected in ((0, supervisor.DEADLINE_EXCEEDED), (None, supervisor.CLEANUP_UNCONFIRMED)):
+            with self.subTest(rc=rc), self.linux_links():
+                child = supervisor.Child
+                calls = []
+                fake = Mock(rc=rc)
+
+                def spawn(task, fds=()):
+                    if task.__name__ == 'remove_parent':
+                        return fake
+                    return child(task, fds)
+
+                wait = supervisor.wait_child
+
+                def observe(process, cutoff, honor_cancel=False):
+                    if process is fake:
+                        calls.append(cutoff)
+                        return None
+                    return wait(process, cutoff, honor_cancel)
+
+                self.log.clear()
+                with patch.object(supervisor, 'Child', side_effect=spawn), \
+                        patch.object(supervisor, 'wait_child', side_effect=observe):
+                    self.assertEqual(self.clean(), expected, self.log)
+                self.assertTrue(calls)
+                self.assertTrue(self.work.parent.exists())
+                self.work.mkdir(mode=0o700)
+                self.pin_replacement_fixture()
+
+    def test_nonempty_parent_blocks_cleanup_without_removing_foreign_file(self):
+        marker = self.work.parent / 'keep'
+        marker.touch()
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            if sys.platform == 'darwin' and fd == self.pinned[0] and not self.work.exists():
+                from types import SimpleNamespace
+                return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=0)
+            return info
+
+        with patch.object(supervisor.os, 'fstat', side_effect=fstat):
+            self.assertEqual(self.clean(), supervisor.INCOMPLETE)
+        self.assertFalse(self.work.exists())
+        self.assertTrue(marker.is_file())
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=parent_remove_error', self.log)
 
     def test_stat_errors_block(self):
         for name in ('fstat', 'lstat'):
@@ -466,13 +818,14 @@ class CleanupIdentity(unittest.TestCase):
             return code, 0
 
         def observe_run(*args):
-            seen.extend(args[-1][:2])
+            seen.extend((*args[-1][:2], args[-1][4]))
             return 0
 
         with patch.object(supervisor, 'supervise', side_effect=observe_run), \
                 patch.object(supervisor, 'decide', side_effect=observe_decision):
-            self.assertEqual(supervisor.run(str(self.work), ISO, FILES_HASH, self.created_identity, 0, 1200, []), (0, 0))
-        self.assertEqual(len(seen), 2)
+            self.assertEqual(supervisor.run(self.work.parent.name, ISO, FILES_HASH, self.parent_identity,
+                                            self.created_identity, 0, 1200, []), (0, 0))
+        self.assertEqual(len(seen), 3)
         for fd in seen:
             with self.assertRaises(OSError) as raised:
                 os.fstat(fd)

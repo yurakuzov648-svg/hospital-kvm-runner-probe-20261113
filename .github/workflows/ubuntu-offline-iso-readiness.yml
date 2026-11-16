@@ -17,35 +17,19 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          started=$SECONDS
-          stage=preflight
-          work=
-          finish() {
-            rc=$?
-            trap - EXIT
-            if [[ -n "$work" ]]; then
-              printf 'CLEANUP_STATUS=unconfirmed REASON=pre_supervisor_exit\n'
-            fi
-            printf 'STAGE=%s EXIT_CODE=%s STEP_SECONDS=%s RESULT=VM_TEST_INCOMPLETE\n' \
-              "$stage" "$rc" "$((SECONDS - started))"
-            exit "$rc"
-          }
-          trap finish EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-
           . /etc/os-release
           [[ "$ID:$VERSION_ID:$(uname -m)" == ubuntu:24.04:x86_64 ]]
           [[ -c /dev/kvm && ! -L /dev/kvm ]]
-          python3 -B -E -s supervisor.py --check-parent "${RUNNER_TEMP:?}"
-          work=$(mktemp -d -- "${RUNNER_TEMP:?}/offline-iso-readiness.XXXXXXXX")
-          created_identity=$(stat -c '%d:%i' -- "$work")
-          bundle=$(pwd -P)
-          cd -- "$work"
+          exec python3 -B -E -s -u supervisor.py --prepare-and-run <<'PREPARE'
+          set -euo pipefail
+          umask 077
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          work=$1
+          bundle=$2
           free_kib=$(df -Pk . | awk 'NR == 2 {print $4}')
           [[ "$free_kib" =~ ^[0-9]+$ && "$free_kib" -ge 4194304 ]]
 
-          stage=install_packages
           cat > ubuntu.list <<'APT'
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
@@ -58,29 +42,33 @@ jobs:
             packages+=(acl)
           fi
           sudo -n apt-get "${apt_source[@]}" install -y --no-install-recommends "${packages[@]}"
-          qemu-system-x86_64 --version
+          qemu_output=$(qemu-system-x86_64 --version)
+          qemu_first=${qemu_output%%$'\n'*}
+          qemu_pattern='^QEMU emulator version ([0-9]{1,4}(\.[0-9]{1,4}){2}(-rc[0-9]{1,4})?)([[:blank:]]|$)'
+          [[ "$qemu_first" =~ $qemu_pattern ]] || exit 1
+          qemu_version=${BASH_REMATCH[1]}
 
-          stage=kvm_access
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             sudo -n setfacl -m "u:$(id -u):rw" -- /dev/kvm
             echo KVM_ACL=applied
           else
             echo KVM_ACL=not_needed
           fi
-          python3 - <<'PY'
+          kvm_api=$(python3 - <<'PY'
           import fcntl
           import os
           fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
           try:
               version = fcntl.ioctl(fd, 0xAE00, 0)
-              print(f'KVM_API_VERSION={version}')
               if version != 12:
                   raise SystemExit(1)
+              print(version)
           finally:
               os.close(fd)
           PY
+          )
+          [[ "$kvm_api" == 12 ]]
 
-          stage=verify_image
           base=https://cloud-images.ubuntu.com/releases/noble/release
           image=ubuntu-24.04-server-cloudimg-amd64.img
           download() {
@@ -99,9 +87,9 @@ jobs:
           ' SHA256SUMS > image.sha256
           download "$image" 180
           sha256sum --check --strict image.sha256
-          printf 'VERIFIED_IMAGE_SHA256=%s\n' "$(cut -d ' ' -f1 image.sha256)"
+          image_hash=$(cut -d ' ' -f1 image.sha256)
+          [[ "$image_hash" =~ ^[0-9a-f]{64}$ ]]
 
-          stage=prepare_media
           mv -- "$image" guest.img
           python3 - <<'PY'
           import json
@@ -113,14 +101,15 @@ jobs:
               info.get('format-specific', {}).get('data', {}).get('data-file')):
               raise SystemExit(1)
           PY
-          read -r iso_hash files_hash < <(PYTHONPATH="$bundle" python3 -B - "$bundle" <<'PY'
+          media_hashes=$(PYTHONPATH="$bundle" python3 -B - "$bundle" <<'PY'
           from pathlib import Path
           import sys
           from build_iso import build
           print(*build(Path.cwd(), (Path(sys.argv[1]) / 'guest.sh').read_bytes()))
           PY
           )
-          [[ "$iso_hash" =~ ^[0-9a-f]{64}$ && "$files_hash" =~ ^[0-9a-f]{64}$ ]]
-          printf 'HOST_ISO_SHA256=%s HOST_FILE_MANIFEST_SHA256=%s PREP_SECONDS=%s\n' "$iso_hash" "$files_hash" "$((SECONDS - started))"
-          stage=vm_supervisor
-          exec python3 -B -E -s -u "$bundle/supervisor.py" "$work" "$iso_hash" "$files_hash" "$created_identity"
+          read -r iso_hash files_hash extra <<< "$media_hashes"
+          [[ -z "$extra" && "$iso_hash" =~ ^[0-9a-f]{64}$ && "$files_hash" =~ ^[0-9a-f]{64}$ ]]
+          printf 'QEMU_VERSION=%s\nKVM_API_VERSION=%s\nVERIFIED_IMAGE_SHA256=%s\nHOST_ISO_SHA256=%s\nHOST_FILE_MANIFEST_SHA256=%s\n' \
+            "$qemu_version" "$kvm_api" "$image_hash" "$iso_hash" "$files_hash" > preparation.receipt
+          PREPARE
