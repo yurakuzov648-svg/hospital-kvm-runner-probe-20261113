@@ -1,0 +1,126 @@
+name: Offline Ubuntu ISO Readiness
+"on":
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  readiness:
+    if: github.repository == 'yurakuzov648-svg/hospital-kvm-runner-probe-20261113'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate one offline Ubuntu guest
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          started=$SECONDS
+          stage=preflight
+          work=
+          finish() {
+            rc=$?
+            trap - EXIT
+            if [[ -n "$work" ]]; then
+              printf 'CLEANUP_STATUS=unconfirmed REASON=pre_supervisor_exit\n'
+            fi
+            printf 'STAGE=%s EXIT_CODE=%s STEP_SECONDS=%s RESULT=VM_TEST_INCOMPLETE\n' \
+              "$stage" "$rc" "$((SECONDS - started))"
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          . /etc/os-release
+          [[ "$ID:$VERSION_ID:$(uname -m)" == ubuntu:24.04:x86_64 ]]
+          [[ -c /dev/kvm && ! -L /dev/kvm ]]
+          python3 -B -E -s supervisor.py --check-parent "${RUNNER_TEMP:?}"
+          work=$(mktemp -d -- "${RUNNER_TEMP:?}/offline-iso-readiness.XXXXXXXX")
+          created_identity=$(stat -c '%d:%i' -- "$work")
+          bundle=$(pwd -P)
+          cd -- "$work"
+          free_kib=$(df -Pk . | awk 'NR == 2 {print $4}')
+          [[ "$free_kib" =~ ^[0-9]+$ && "$free_kib" -ge 4194304 ]]
+
+          stage=install_packages
+          cat > ubuntu.list <<'APT'
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main universe
+          APT
+          apt_source=(-o "Dir::Etc::sourcelist=$work/ubuntu.list" -o Dir::Etc::sourceparts=-)
+          sudo -n apt-get "${apt_source[@]}" -o APT::Update::Error-Mode=any update
+          packages=(qemu-system-x86 genisoimage ubuntu-keyring)
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]] && ! command -v setfacl >/dev/null; then
+            packages+=(acl)
+          fi
+          sudo -n apt-get "${apt_source[@]}" install -y --no-install-recommends "${packages[@]}"
+          qemu-system-x86_64 --version
+
+          stage=kvm_access
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            sudo -n setfacl -m "u:$(id -u):rw" -- /dev/kvm
+            echo KVM_ACL=applied
+          else
+            echo KVM_ACL=not_needed
+          fi
+          python3 - <<'PY'
+          import fcntl
+          import os
+          fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              version = fcntl.ioctl(fd, 0xAE00, 0)
+              print(f'KVM_API_VERSION={version}')
+              if version != 12:
+                  raise SystemExit(1)
+          finally:
+              os.close(fd)
+          PY
+
+          stage=verify_image
+          base=https://cloud-images.ubuntu.com/releases/noble/release
+          image=ubuntu-24.04-server-cloudimg-amd64.img
+          download() {
+            curl --fail --silent --show-error --proto '=https' \
+              --connect-timeout 15 --max-time "$2" --output "$1" "$base/$1"
+          }
+          download SHA256SUMS 30
+          download SHA256SUMS.gpg 30
+          mkdir -m 0700 gnupg
+          gpgv --homedir "$work/gnupg" \
+            --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg SHA256SUMS.gpg SHA256SUMS
+          awk -v image="$image" '
+            NF==2 && ($2==image || $2=="*" image) &&
+            length($1)==64 && $1 ~ /^[0-9a-f]+$/ { print $1 "  " image; count++ }
+            END { if (count != 1) exit 1 }
+          ' SHA256SUMS > image.sha256
+          download "$image" 180
+          sha256sum --check --strict image.sha256
+          printf 'VERIFIED_IMAGE_SHA256=%s\n' "$(cut -d ' ' -f1 image.sha256)"
+
+          stage=prepare_media
+          mv -- "$image" guest.img
+          python3 - <<'PY'
+          import json
+          import subprocess
+          info = json.loads(subprocess.check_output(
+              ['qemu-img', 'info', '--output=json', 'guest.img'], timeout=15))
+          if (info['format'] != 'qcow2' or 'backing-filename' in info or
+              'full-backing-filename' in info or info.get('encrypted') or
+              info.get('format-specific', {}).get('data', {}).get('data-file')):
+              raise SystemExit(1)
+          PY
+          read -r iso_hash files_hash < <(PYTHONPATH="$bundle" python3 -B - "$bundle" <<'PY'
+          from pathlib import Path
+          import sys
+          from build_iso import build
+          print(*build(Path.cwd(), (Path(sys.argv[1]) / 'guest.sh').read_bytes()))
+          PY
+          )
+          [[ "$iso_hash" =~ ^[0-9a-f]{64}$ && "$files_hash" =~ ^[0-9a-f]{64}$ ]]
+          printf 'HOST_ISO_SHA256=%s HOST_FILE_MANIFEST_SHA256=%s PREP_SECONDS=%s\n' "$iso_hash" "$files_hash" "$((SECONDS - started))"
+          stage=vm_supervisor
+          exec python3 -B -E -s -u "$bundle/supervisor.py" "$work" "$iso_hash" "$files_hash" "$created_identity"
