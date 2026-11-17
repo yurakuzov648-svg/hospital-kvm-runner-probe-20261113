@@ -1,5 +1,8 @@
+from __future__ import annotations
 from contextlib import ExitStack
+from dataclasses import dataclass
 import os
+import errno
 import pathlib
 import re
 import secrets
@@ -50,6 +53,7 @@ class Child:
 
     def __init__(self, task, close_fds=()):
         self.rc = None
+        self.control_lost = False
         self.usage = None
         self.observed_at = None
         self.pid = os.fork()
@@ -73,7 +77,12 @@ class Child:
 
     def poll(self):
         if self.rc is None:
-            pid, status, usage = os.wait4(self.pid, os.WNOHANG)
+            try:
+                pid, status, usage = os.wait4(self.pid, os.WNOHANG)
+            except OSError as exc:
+                if exc.errno == errno.ECHILD:
+                    self.control_lost = True
+                raise
             if pid:
                 self.observed_at = time.monotonic()
                 self.rc = os.waitstatus_to_exitcode(status)
@@ -82,7 +91,7 @@ class Child:
 
     def send(self, signum):
         # Never signal a reaped PID. Before setsid(), signal the child itself.
-        if self.rc is not None:
+        if self.rc is not None or self.control_lost:
             return
         try:
             os.killpg(self.pgid, signum)
@@ -125,7 +134,7 @@ def run_phase(task, cutoff, reap_limit, close_fds=()):
     child = Child(task, close_fds)
     rc = wait_child(child, cutoff)
     if rc is not None:
-        return rc, False
+        return rc, True
     if child.rc is None:
         child.send(signal.SIGKILL)
         wait_child(child, reap_limit)
@@ -603,7 +612,10 @@ def publish(code, elapsed, log):
         CLEANUP_UNCONFIRMED: 'CLEANUP_UNCONFIRMED',
         OWNERSHIP_BLOCKED: 'BLOCK',
     }.get(code, 'VM_TEST_INCOMPLETE')
-    if code == DEADLINE_EXCEEDED:
+    preparation_failed = any(line.startswith('PREPARATION_POLICY_CODE=') for line in log)
+    if preparation_failed:
+        result = 'VM_TEST_INCOMPLETE'
+    if code == DEADLINE_EXCEEDED and not preparation_failed:
         log.append('VM_DEADLINE=exceeded')
     log.append(f'EXIT_CODE={code} RESULT={result} elapsed_seconds={elapsed!r}')
     print('\n'.join(log), flush=True)
@@ -623,44 +635,91 @@ def run(name, iso_hash, files_hash, parent_token, work_token, started, deadline,
         return decide(code, started, deadline)
 
 
-def prepare_workspace(work, pinned, script, bundle, log):
-    def prepare():
-        os.chdir(work)
-        os.execve('/bin/bash', ['bash', '-c', script, 'prepare', work, bundle], os.environ)
+@dataclass(frozen=True)
+class PreparationOutcome:
+    # observed_rc is wait4 evidence: negative means signal, never 128+signal.
+    observed_rc: int | None
+    termination: str
+    policy_code: int
+    cancellation: bool
+    stopped: bool
 
+
+def preparation_outcome(rc, stopped, *, termination=None):
+    kind = termination or ('unknown' if rc is None else 'signal' if rc < 0 else 'exit')
+    policy = INCOMPLETE if rc is None else (128 - rc if rc < 0 else rc)
+    if not stopped and policy == 0:
+        policy = INCOMPLETE
     if cancelled:
-        return 128 + cancel_signal, True
-    # In the parent Child can raise OSError only at fork; after that point
-    # poll/wait errors must follow the unconfirmed-stop path.
-    try:
-        child = Child(prepare, (*pinned[:2], pinned[4]))
-    except OSError as exc:
-        log.append('PREPARATION_FAILURE=fork_failed')
-        number = exc.errno
-        if isinstance(number, int) and 0 < number < 256:
-            log.append(f'PREPARATION_FORK_ERRNO={number}')
-        return INCOMPLETE, True
-    while not cancelled:
-        rc = child.poll()
-        if rc is not None:
-            # A signalled shell cannot attest that foreground preparation ended.
-            return (128 - rc if rc < 0 else rc), rc >= 0
-        time.sleep(POLL_INTERVAL)
+        policy = 128 + cancel_signal
+    return PreparationOutcome(rc, kind, policy, cancelled, stopped)
 
-    code = 128 + cancel_signal
+
+def prepare_workspace(work, pinned, script, bundle, log):
+    if cancelled:
+        return preparation_outcome(None, True, termination='not_started')
     try:
-        # Bash traps run after foreground commands return. Avoid killing those
-        # commands first, so a cooperative shell exit can attest quiescence.
-        if child.rc is None:
-            os.kill(child.pid, cancel_signal)
-        rc = wait_child(child, time.monotonic() + 5)
-        if rc is not None and rc >= 0:
-            return code, True
-    except (OSError, ChildProcessError):
-        pass
-    stop_child(child, time.monotonic() + 2, grace=0.5)
-    log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
-    return code, False
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        log.append('PREPARATION_FAILURE=pipe_failed')
+        return preparation_outcome(None, True, termination='not_started')
+
+    try:
+        os.set_blocking(read_fd, False)
+    except OSError:
+        os.close(write_fd)
+        os.close(read_fd)
+        log.append('PREPARATION_FAILURE=pipe_failed')
+        return preparation_outcome(None, True, termination='not_started')
+
+    def prepare():
+        os.close(read_fd)
+        os.chdir(work)
+        os.set_inheritable(write_fd, True)
+        prefix = f"printf B >&{write_fd} || exit 125; exec {write_fd}>&-\n"
+        os.execve('/bin/bash', ['bash', '-c', prefix + script, 'prepare', work, bundle], os.environ)
+
+    def outcome(rc, stopped):
+        try:
+            ack = os.read(read_fd, 2)
+        except OSError:
+            ack = b''
+        if ack != b'B':
+            log.append('PREPARATION_FAILURE=bash_start_unconfirmed')
+            return preparation_outcome(None, stopped, termination='unknown')
+        return preparation_outcome(rc, stopped)
+
+    try:
+        try:
+            child = Child(prepare, (*pinned[:2], pinned[4]))
+        except OSError as exc:
+            log.append('PREPARATION_FAILURE=fork_failed')
+            number = exc.errno
+            if isinstance(number, int) and 0 < number < 256:
+                log.append(f'PREPARATION_FORK_ERRNO={number}')
+            return preparation_outcome(None, True, termination='not_started')
+        finally:
+            os.close(write_fd)
+        try:
+            while not cancelled:
+                rc = child.poll()
+                if rc is not None:
+                    return outcome(rc, rc >= 0)
+                time.sleep(POLL_INTERVAL)
+            # Only a cooperative normal shell exit attests foreground quiescence.
+            if child.rc is None:
+                os.kill(child.pid, cancel_signal)
+            rc = wait_child(child, time.monotonic() + 5)
+            if rc is not None and rc >= 0:
+                return outcome(rc, True)
+        except (OSError, ChildProcessError):
+            log.append('PREPARATION_FAILURE=observation_error')
+        # Best effort stop; forced stop never grants rollback.
+        stop_child(child, time.monotonic() + 2, grace=0.5)
+        log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
+        return outcome(child.rc, False)
+    finally:
+        os.close(read_fd)
 
 
 PREPARATION_FIELDS = (
@@ -690,6 +749,30 @@ def read_preparation_receipt(work):
     return dict(zip(PREPARATION_FIELDS, (value.decode('ascii') for value in match.groups())))
 
 
+PREPARATION_STAGES = frozenset({
+    'disk_preflight', 'apt_update', 'apt_install', 'qemu_version', 'kvm_access',
+    'image_download', 'image_signature', 'image_hash', 'image_format',
+    'iso_build', 'receipt_write',
+})
+
+
+def failed_preparation_stage(work_fd, exit_code):
+    try:
+        fd = os.open('preparation.failure', os.O_RDONLY | os.O_NOFOLLOW |
+                     os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=work_fd)
+        with os.fdopen(fd, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return 'unknown'
+            payload = stream.read(65)
+    except OSError:
+        return 'unknown'
+    match = re.fullmatch(rb'([a-z_]{1,32}) ([1-9][0-9]{0,2})\n', payload)
+    if match is None or not 1 <= exit_code <= 255 or int(match[2]) != exit_code:
+        return 'unknown'
+    stage = match[1].decode('ascii')
+    return stage if stage in PREPARATION_STAGES else 'unknown'
+
+
 def run_workflow(script, bundle, log):
     started = time.monotonic()
     with ExitStack() as descriptors:
@@ -701,16 +784,25 @@ def run_workflow(script, bundle, log):
             code = 128 + cancel_signal if cancelled else OWNERSHIP_BLOCKED
             return code, time.monotonic() - started
 
-        try:
-            code, stopped = prepare_workspace(work, pinned, script, bundle, log)
-        except (OSError, ChildProcessError):
-            log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_supervision')
-            return INCOMPLETE, time.monotonic() - started
-        if not stopped:
-            if not cancelled:
-                log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
+        outcome = prepare_workspace(work, pinned, script, bundle, log)
+        code = outcome.policy_code
+        stage = (failed_preparation_stage(pinned[0], outcome.observed_rc)
+                 if outcome.stopped and outcome.termination == 'exit' and outcome.observed_rc != 0
+                 else 'unknown')
+        log.append(f'PREPARATION_TERMINATION={outcome.termination}')
+        if outcome.termination == 'exit':
+            log.append(f'PREPARATION_EXIT_CODE={outcome.observed_rc}')
+        elif outcome.termination == 'signal':
+            log.append(f'PREPARATION_SIGNAL={-outcome.observed_rc}')
+        if not outcome.stopped:
+            if cancelled:
+                code = 128 + cancel_signal
+            log.append('PREPARATION_CANCELLED=' + ('yes' if cancelled else 'no'))
+            log.append('PREP_STAGE=unknown')
+            log.append(f'PREPARATION_POLICY_CODE={code}')
+            log.append('CLEANUP_STATUS=unconfirmed REASON=preparation_stop')
             return code, time.monotonic() - started
-        if cancelled and code == 0:
+        if cancelled:
             code = 128 + cancel_signal
         if code == 0:
             try:
@@ -724,15 +816,20 @@ def run_workflow(script, bundle, log):
             except (ControlBlocked, OSError):
                 log.append('PREPARATION_FAILURE=workspace_recheck')
                 code = OWNERSHIP_BLOCKED
-        if cancelled and code == 0:
+        if cancelled:
             code = 128 + cancel_signal
         if code != 0:
-            log.append(f'PREPARATION_EXIT_CODE={code}')
+            log.append(f'PREP_STAGE={stage}')
             cutoff = time.monotonic() + 10
             rollback = clean_work(work, pinned, cutoff, cutoff + REAP_REMAINING, log)
             log.append('PREPARATION_ROLLBACK=' + ('confirmed' if rollback == 0 else 'unconfirmed'))
+            if cancelled:
+                code = 128 + cancel_signal
+            log.append(f'PREPARATION_POLICY_CODE={code}')
+            log.append('PREPARATION_CANCELLED=' + ('yes' if cancelled else 'no'))
             return code, time.monotonic() - started
 
+        log.append('PREPARATION_CANCELLED=' + ('yes' if cancelled else 'no'))
         log.extend(f'{key}={evidence[key]}' for key in PREPARATION_FIELDS)
         log.append(f'PREP_SECONDS={time.monotonic() - started:.3f}')
         started = time.monotonic()
@@ -742,7 +839,32 @@ def run_workflow(script, bundle, log):
         return decide(code, started, deadline)
 
 
+def write_preparation_failure(stage, code):
+    """Best-effort diagnostic only; no existing filesystem object is opened."""
+    if stage not in PREPARATION_STAGES or not re.fullmatch(r'[1-9][0-9]{0,2}', code):
+        return False
+    if not 1 <= int(code) <= 255:
+        return False
+    payload = f'{stage} {code}\n'.encode('ascii')
+    if len(payload) > 64:
+        return False
+    try:
+        fd = os.open('preparation.failure', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            # One bounded record. Partial writes fail closed in the reader.
+            return os.write(fd, payload) == len(payload)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
 if __name__ == '__main__':
+    if len(sys.argv) == 4 and sys.argv[1] == '--write-preparation-failure':
+        sys.exit(0 if write_preparation_failure(*sys.argv[2:]) else 1)
     for signum in CANCEL_SIGNALS:
         signal.signal(signum, cancel)
     log = []

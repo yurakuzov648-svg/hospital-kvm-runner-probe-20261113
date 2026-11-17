@@ -287,6 +287,32 @@ while True:
                 self.assertEqual(supervisor.supervise(str(work), ISO, FILES_HASH, start, start + 1200, [], pinned), 23)
             self.assertTrue(work.exists())
 
+    def test_serial_eof_before_qemu_exit_still_waits(self):
+        producer = f'import os,time\nos.write(1,{self.good_serial()!r})\nos.close(1)\ntime.sleep(0.2)\n'
+        run, exists = self.fake_run(b'', producer=producer)
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertIn('QEMU_EXIT_CODE=0 QEMU_REAP=confirmed', run.stdout)
+        self.assertFalse(exists)
+
+    def test_good_serial_nonzero_qemu_exit_fails(self):
+        producer = f'import os\nos.write(1,{self.good_serial()!r})\nraise SystemExit(9)\n'
+        run, exists = self.fake_run(b'', producer=producer)
+        self.assertEqual(run.returncode, 20, run.stdout)
+        self.assertNotIn('OFFLINE_ISO_READY', run.stdout)
+        self.assertFalse(exists)
+
+    def test_serial_cancel_never_reads_or_succeeds(self):
+        from unittest.mock import Mock
+        read_fd, write_fd = os.pipe()
+        try:
+            with patch.object(supervisor, 'cancelled', True):
+                self.assertEqual(supervisor.collect_serial(Mock(), read_fd, supervisor.time.monotonic()+1),
+                                 (None, bytearray(), False))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+
 
 class CleanupIdentity(unittest.TestCase):
     def setUp(self):
@@ -563,7 +589,8 @@ class CleanupIdentity(unittest.TestCase):
                 boot.assert_not_called()
                 self.assertIn('PREPARATION_FAILURE=fork_failed', log)
                 self.assertIn(f'PREPARATION_FORK_ERRNO={errno.EAGAIN}', log)
-                self.assertIn(f'PREPARATION_EXIT_CODE={supervisor.INCOMPLETE}', log)
+                self.assertIn(f'PREPARATION_POLICY_CODE={supervisor.INCOMPLETE}', log)
+                self.assertFalse(any(x.startswith('PREPARATION_EXIT_CODE=') for x in log))
                 self.assertNotIn('synthetic secret', '\n'.join(log))
                 if persistent:
                     self.assertIn('PREPARATION_ROLLBACK=unconfirmed', log)
@@ -578,16 +605,59 @@ class CleanupIdentity(unittest.TestCase):
         log = []
         with patch.object(supervisor, 'Child') as child, patch.object(supervisor, 'clean_work') as cleanup, \
                 patch.object(supervisor, 'supervise') as boot:
+            child.return_value.rc = None
             child.return_value.poll.side_effect = OSError(errno.EIO, 'raw diagnostic')
             code, _ = supervisor.run_workflow('', str(ROOT), log)
         self.assertEqual(code, supervisor.INCOMPLETE)
-        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=preparation_supervision', log)
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=preparation_stop', log)
         self.assertNotIn('raw diagnostic', '\n'.join(log))
         child.assert_called_once()
         cleanup.assert_not_called()
         boot.assert_not_called()
         parent, = set(self.parent.iterdir()) - before
         self.assertTrue((parent / 'vm').is_dir())
+
+    @staticmethod
+    def diagnostic_trap():
+        workflow = (ROOT / '.github/workflows/ubuntu-offline-iso-readiness.yml').read_text()
+        start = workflow.index('          work=$1')
+        end = workflow.index('          free_kib=', start)
+        return '\n'.join(line[10:] for line in workflow[start:end].splitlines()) + '\n'
+
+    def check_preparation_diagnostics(self, script, stage, expected):
+        before = set(self.parent.iterdir())
+        log = []
+        with self.linux_links(), patch.object(supervisor, 'supervise') as boot:
+            code, _ = supervisor.run_workflow(script, str(ROOT), log)
+        self.assertEqual(code, expected, log)
+        self.assertIn(f'PREP_STAGE={stage}', log)
+        self.assertIn(f'PREPARATION_EXIT_CODE={expected}', log)
+        self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+        self.assertNotIn('OFFLINE_ISO_READY', '\n'.join(log))
+        self.assertNotIn('SYNTHETIC_RAW', '\n'.join(log))
+        self.assertEqual(set(self.parent.iterdir()), before)
+        boot.assert_not_called()
+
+    def test_preparation_diagnostics_all_stages_keep_actual_status(self):
+        for index, stage in enumerate(sorted(supervisor.PREPARATION_STAGES), 1):
+            with self.subTest(stage=stage):
+                script = self.diagnostic_trap() + (
+                    f'prep_stage={stage}\necho SYNTHETIC_RAW; echo SYNTHETIC_RAW >&2; exit {index}'
+                )
+                self.check_preparation_diagnostics(script, stage, index)
+
+    def test_bad_preparation_diagnostics_are_unknown(self):
+        for record in ('apt_update 8', 'invalid_stage 7', 'apt_update 7\nSYNTHETIC_RAW',
+                       'X' * 90, ''):
+            with self.subTest(record=record):
+                import shlex
+                script = f'printf "%s\\n" {shlex.quote(record)} > preparation.failure; exit 7'
+                self.check_preparation_diagnostics(script, 'unknown', 7)
+        self.check_preparation_diagnostics('ln -s /dev/null preparation.failure; exit 7', 'unknown', 7)
+
+    def test_preparation_diagnostic_write_failure_preserves_rollback(self):
+        script = self.diagnostic_trap() + 'prep_stage=receipt_write; mkdir preparation.failure; exit 9'
+        self.check_preparation_diagnostics(script, 'unknown', 9)
 
     def test_receipt_publishes_all_five_values_with_mock_vm(self):
         import contextlib
@@ -689,7 +759,7 @@ class CleanupIdentity(unittest.TestCase):
     def test_unconfirmed_preparation_leaves_workspace(self):
         before = set(self.parent.iterdir())
         log = []
-        with patch.object(supervisor, 'prepare_workspace', return_value=(143, False)), \
+        with patch.object(supervisor, 'prepare_workspace', return_value=supervisor.PreparationOutcome(-15, 'signal', 143, False, False)), \
                 patch.object(supervisor, 'clean_work') as cleanup:
             code, _ = supervisor.run_workflow('', str(ROOT), log)
         self.assertEqual(code, 143)
@@ -832,6 +902,373 @@ class CleanupIdentity(unittest.TestCase):
             self.assertEqual(raised.exception.errno, errno.EBADF)
 
 
+    def test_signal_exit_is_not_bash_exit_137(self):
+        log = []
+        with patch.object(supervisor, 'clean_work') as cleanup, patch.object(supervisor, 'supervise') as boot:
+            code, _ = supervisor.run_workflow('printf "apt_update 137\n" > preparation.failure; kill -KILL $$', str(ROOT), log)
+        self.assertEqual(code, 137, log)
+        self.assertIn('PREPARATION_TERMINATION=signal', log)
+        self.assertIn('PREPARATION_SIGNAL=9', log)
+        self.assertIn('PREP_STAGE=unknown', log)
+        self.assertFalse(any(x.startswith('PREPARATION_EXIT_CODE=') for x in log))
+        cleanup.assert_not_called()
+        boot.assert_not_called()
+
+    def test_cancel_before_bash_does_not_spawn(self):
+        import signal
+        with patch.object(supervisor, 'cancelled', True), patch.object(supervisor, 'cancel_signal', signal.SIGINT), \
+                patch.object(supervisor, 'Child') as child:
+            result = supervisor.prepare_workspace(str(self.work), self.pinned, '', str(ROOT), [])
+        self.assertEqual(result, supervisor.PreparationOutcome(None, 'not_started', 130, True, True))
+        child.assert_not_called()
+
+    def test_cancel_policy_143_keeps_observed_exit_7(self):
+        import signal
+        log = []
+        original = supervisor.prepare_workspace
+        def prepare(*args):
+            outcome = original(*args)
+            supervisor.cancel(signal.SIGTERM, None)
+            return supervisor.preparation_outcome(outcome.observed_rc, outcome.stopped)
+        with self.linux_links(), patch.object(supervisor, 'cancelled', False), \
+                patch.object(supervisor, 'cancel_signal', None), \
+                patch.object(supervisor, 'prepare_workspace', side_effect=prepare), \
+                patch.object(supervisor, 'supervise') as boot:
+            code, _ = supervisor.run_workflow(self.diagnostic_trap() + 'prep_stage=apt_update; exit 7', str(ROOT), log)
+        self.assertEqual(code, 143, log)
+        self.assertIn('PREPARATION_EXIT_CODE=7', log)
+        self.assertIn('PREPARATION_POLICY_CODE=143', log)
+        self.assertIn('PREP_STAGE=apt_update', log)
+        self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+        boot.assert_not_called()
+
+    def test_cancel_during_poll_keeps_exit_evidence(self):
+        import signal
+        real_poll = supervisor.Child.poll
+        def poll(child):
+            rc = real_poll(child)
+            if rc is not None:
+                supervisor.cancel(signal.SIGTERM, None)
+            return rc
+        with patch.object(supervisor, 'cancelled', False), patch.object(supervisor, 'cancel_signal', None), \
+                patch.object(supervisor.Child, 'poll', poll):
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, 'exit 7', str(ROOT), [])
+        self.assertEqual(outcome.observed_rc, 7)
+        self.assertEqual(outcome.policy_code, 143)
+        self.assertTrue(outcome.stopped)
+
+    def test_lost_observation_then_zero_never_success(self):
+        from unittest.mock import Mock
+        child = Mock(rc=None)
+        child.poll.side_effect = OSError(errno.EIO)
+        def stop(process, *args, **kwargs):
+            process.rc = 0
+            return 0
+        with patch.object(supervisor, 'Child', return_value=child), \
+                patch.object(supervisor, 'stop_child', side_effect=stop), \
+                patch.object(supervisor.os, 'read', return_value=b'B'):
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, '', str(ROOT), [])
+        self.assertEqual(outcome.observed_rc, 0)
+        self.assertEqual(outcome.policy_code, supervisor.INCOMPLETE)
+        self.assertFalse(outcome.stopped)
+
+    def test_execve_failure_is_not_bash_exit(self):
+        with patch.object(supervisor.os, 'execve', side_effect=OSError(errno.ENOENT)):
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, 'exit 0', str(ROOT), [])
+        self.assertIsNone(outcome.observed_rc)
+        self.assertEqual(outcome.policy_code, 21)
+        self.assertTrue(outcome.stopped)
+
+    def test_prepare_pipe_failure_no_child(self):
+        with patch.object(supervisor.os, 'pipe', side_effect=OSError(errno.EMFILE)), \
+                patch.object(supervisor, 'Child') as child:
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, '', str(ROOT), [])
+        self.assertEqual(outcome.termination, 'not_started')
+        self.assertTrue(outcome.stopped)
+        self.assertEqual(outcome.policy_code, 21)
+        child.assert_not_called()
+
+    def trap_subprocess(self, setup='', body='exit 7', bundle=None):
+        # An outer timeout is mandatory for FIFO/resource regressions.
+        script = self.diagnostic_trap() + setup + '\nprep_stage=apt_update\n' + body
+        return subprocess.run(['/bin/bash', '-c', script, 'fixture', str(self.work), str(bundle or ROOT)],
+                              cwd=self.work, capture_output=True, timeout=3)
+
+    def test_diagnostic_existing_fifo_returns_promptly(self):
+        os.mkfifo(self.work / 'preparation.failure')
+        run = self.trap_subprocess()
+        self.assertEqual(run.returncode, 7)
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_diagnostic_existing_symlink_keeps_target(self):
+        target = self.work / 'keep'
+        target.write_bytes(b'original')
+        (self.work / 'preparation.failure').symlink_to(target)
+        self.assertEqual(self.trap_subprocess().returncode, 7)
+        self.assertEqual(target.read_bytes(), b'original')
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_diagnostic_existing_regular_file_not_overwritten(self):
+        target = self.work / 'preparation.failure'
+        target.write_bytes(b'existing')
+        self.assertEqual(self.trap_subprocess().returncode, 7)
+        self.assertEqual(target.read_bytes(), b'existing')
+
+    def test_diagnostic_existing_directory_returns_promptly(self):
+        (self.work / 'preparation.failure').mkdir()
+        self.assertEqual(self.trap_subprocess().returncode, 7)
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_diagnostic_helper_cannot_start_preserves_status(self):
+        self.assertEqual(self.trap_subprocess(bundle=self.work / 'absent').returncode, 7)
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_diagnostic_python_exec_resource_error_preserves_status(self):
+        self.assertEqual(self.trap_subprocess(setup='python3() { return 126; }').returncode, 7)
+        self.assertFalse((self.work / 'preparation.failure').exists())
+
+    def test_diagnostic_writer_open_error(self):
+        with patch.object(supervisor.os, 'open', side_effect=OSError(errno.ENOSPC)):
+            self.assertFalse(supervisor.write_preparation_failure('apt_update', '7'))
+
+    def test_diagnostic_writer_write_error_and_partial_write(self):
+        # Run the actual helper function in the private cwd; never chdir the test parent.
+        for behavior in ('raise OSError(28, "synthetic")', 'return original(fd, data[:3])', 'return 0'):
+            target = self.work / 'preparation.failure'
+            target.unlink(missing_ok=True)
+            script = ('import os,sys; sys.path.insert(0, sys.argv[1]); import supervisor\n'
+                      'original=os.write\ndef write(fd,data):\n    ' + behavior + '\n'
+                      'supervisor.os.write=write\n'
+                      'assert not supervisor.write_preparation_failure("apt_update", "7")\n')
+            run = subprocess.run([sys.executable, '-B', '-c', script, str(ROOT)], cwd=self.work,
+                                 capture_output=True, timeout=3)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_diagnostic_writer_mode_and_exact_payload(self):
+        self.assertEqual(self.trap_subprocess().returncode, 7)
+        target = self.work / 'preparation.failure'
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.read_bytes(), b'apt_update 7\n')
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'apt_update')
+
+    def test_diagnostic_writer_invalid_inputs_never_open(self):
+        for stage, code in (('unknown', '7'), ('apt_update', '0'), ('apt_update', '256'),
+                            ('apt_update', '7\n'), ('apt_update', '-9'), ('x'*80, '1')):
+            with patch.object(supervisor.os, 'open') as opened:
+                self.assertFalse(supervisor.write_preparation_failure(stage, code))
+                opened.assert_not_called()
+
+    def test_diagnostic_read_error_and_missing_file_unknown(self):
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+        with patch.object(supervisor.os, 'open', side_effect=OSError(errno.EIO)):
+            self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 7), 'unknown')
+
+    def test_failed_bash_with_valid_success_receipt_never_boots(self):
+        with self.linux_links(), patch.object(supervisor, 'supervise') as boot:
+            log = []
+            code, _ = supervisor.run_workflow(self.write_receipt(self.preparation_fields()) + '; exit 7', str(ROOT), log)
+        self.assertEqual(code, 7)
+        self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+        boot.assert_not_called()
+
+    def test_invalid_receipt_retains_bash_zero_and_policy_21(self):
+        log = []
+        with self.linux_links():
+            code, _ = supervisor.run_workflow('exit 0', str(ROOT), log)
+        self.assertEqual(code, 21)
+        self.assertIn('PREPARATION_EXIT_CODE=0', log)
+        self.assertIn('PREPARATION_POLICY_CODE=21', log)
+        self.assertIn('PREP_STAGE=unknown', log)
+
+    def test_reserved_preparation_codes_do_not_claim_vm_results(self):
+        import contextlib, io
+        for code in range(20, 27):
+            log = [f'PREPARATION_POLICY_CODE={code}']
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                supervisor.publish(code, 0, log)
+            self.assertIn('RESULT=VM_TEST_INCOMPLETE', out.getvalue())
+            self.assertNotIn('VM_DEADLINE=exceeded', out.getvalue())
+
+    def test_base_modes_and_wrong_owner(self):
+        from types import SimpleNamespace
+        for mode in (0o700, 0o750, 0o755):
+            self.parent.chmod(mode)
+            with ExitStack() as stack:
+                self.pin(stack)
+        real = os.fstat(self.pinned[4])
+        wrong = SimpleNamespace(st_mode=real.st_mode, st_uid=os.geteuid()+1)
+        with patch.object(supervisor.os, 'fstat', return_value=wrong):
+            with self.assertRaisesRegex(supervisor.ControlBlocked, 'parent_unexpected_owner'):
+                supervisor.require_directory_identity(str(self.parent), self.pinned[4], False)
+
+    def test_success_receipt_special_files_fail_without_blocking(self):
+        target = self.work / 'preparation.receipt'
+        for kind in ('fifo', 'symlink', 'directory'):
+            if kind == 'fifo': os.mkfifo(target)
+            elif kind == 'symlink': target.symlink_to('/dev/null')
+            else: target.mkdir()
+            with self.assertRaises((supervisor.ControlBlocked, OSError)):
+                supervisor.read_preparation_receipt(str(self.work))
+            if kind == 'directory': target.rmdir()
+            else: target.unlink()
+
+    def test_pipeline_and_command_substitution_keep_failure_stage(self):
+        for body in ('false | true', 'value=$(false)'):
+            self.check_preparation_diagnostics('set -euo pipefail\n' + self.diagnostic_trap() +
+                                               'prep_stage=image_hash\n' + body, 'image_hash', 1)
+
+    def test_echild_revokes_signal_authority(self):
+        child = supervisor.Child.__new__(supervisor.Child)
+        child.rc = None
+        child.control_lost = False
+        child.pid = child.pgid = 999999
+        with patch.object(supervisor.os, 'wait4', side_effect=ChildProcessError(errno.ECHILD, 'lost')):
+            with self.assertRaises(ChildProcessError):
+                child.poll()
+        self.assertTrue(child.control_lost)
+        with patch.object(supervisor.os, 'kill') as kill, patch.object(supervisor.os, 'killpg') as group:
+            child.send(supervisor.signal.SIGKILL)
+        kill.assert_not_called()
+        group.assert_not_called()
+
+    def test_cancel_during_diagnostic_helper(self):
+        run = self.trap_subprocess(setup='python3() { kill -TERM $$; return 1; }')
+        self.assertEqual(run.returncode, 143)
+        self.assertEqual(supervisor.failed_preparation_stage(self.pinned[0], 143), 'unknown')
+
+    def test_forced_preparation_stop_never_authorizes_cleanup(self):
+        from unittest.mock import Mock
+        import signal
+        child = Mock(rc=None)
+        def spawn(*args):
+            supervisor.cancel(signal.SIGTERM, None)
+            return child
+        def stop(process, *args, **kwargs):
+            process.rc = -9
+            return -9
+        with patch.object(supervisor, 'cancelled', False), patch.object(supervisor, 'cancel_signal', None), \
+                patch.object(supervisor, 'Child', side_effect=spawn), \
+                patch.object(supervisor.os, 'kill'), patch.object(supervisor.os, 'read', return_value=b'B'), \
+                patch.object(supervisor, 'wait_child', return_value=None), \
+                patch.object(supervisor, 'stop_child', side_effect=stop):
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, '', str(ROOT), [])
+        self.assertEqual(outcome.observed_rc, -9)
+        self.assertEqual(outcome.policy_code, 143)
+        self.assertFalse(outcome.stopped)
+
+    def test_parent_inode_retained_rejects_path_disappearance(self):
+        from types import SimpleNamespace
+        original = os.fstat
+        with self.linux_links():
+            linux_fstat = os.fstat
+            def fstat(fd):
+                info = linux_fstat(fd)
+                if fd == self.pinned[1] and not self.work.parent.exists():
+                    return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=1)
+                return info
+            with patch.object(supervisor.os, 'fstat', side_effect=fstat):
+                self.assertEqual(self.clean(), supervisor.INCOMPLETE)
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=parent_inode_retained', self.log)
+
+    def test_deadline_between_rm_and_rmdir(self):
+        # Advance only after vm absence observation; preserve the live parent.
+        original = supervisor.run_phase
+        now = supervisor.time.monotonic()
+        clock = [now]
+        def phase(*args):
+            result = original(*args)
+            clock[0] = now + 9.5
+            return result
+        with self.linux_links(), patch.object(supervisor.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(supervisor, 'run_phase', side_effect=phase):
+            self.assertEqual(supervisor.clean_work(str(self.work), self.pinned, now+10, now+11, self.log), 22)
+        self.assertFalse(self.work.exists())
+        self.assertTrue(self.work.parent.exists())
+        self.assertIn('CLEANUP_STATUS=unconfirmed REASON=rmdir_budget_before_start', self.log)
+
+
+    @staticmethod
+    def full_preparation_script(fail_stage=None, fail_code=47):
+        workflow = (ROOT / '.github/workflows/ubuntu-offline-iso-readiness.yml').read_text()
+        source = workflow.split("<<'PREPARE'\n", 1)[1].rsplit('          PREPARE', 1)[0]
+        source = '\n'.join(line[10:] for line in source.splitlines()) + '\n'
+        # All privileged/network/tool operations are shell functions; ordinary
+        # file operations, Bash flow, parsing, traps and supervisor are real.
+        stubs = r'''
+df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 9999999 0 9999999 0%% .\n'; }
+sudo() { return 0; }
+qemu-system-x86_64() { printf 'QEMU emulator version 8.2.2 (fixture)\n'; }
+curl() {
+  local out=
+  while (( $# )); do
+    if [[ $1 == --output ]]; then out=$2; shift; fi
+    shift
+  done
+  if [[ $out == SHA256SUMS ]]; then
+    printf '%064d  ubuntu-24.04-server-cloudimg-amd64.img\n' 0 > "$out"
+  else
+    printf fixture > "$out"
+  fi
+}
+gpgv() { return 0; }
+sha256sum() { return 0; }
+python3() {
+  if [[ $* == *--write-preparation-failure* ]]; then command python3 "$@"; return $?; fi
+  cat >/dev/null
+  case "$prep_stage" in
+    kvm_access) printf '12\n' ;;
+    image_format) return 0 ;;
+    iso_build) printf '%064d %064d\n' 1 2 ;;
+    *) return 99 ;;
+  esac
+}
+'''
+        if fail_stage:
+            needle = f'prep_stage={fail_stage}\n'
+            assert needle in source
+            source = source.replace(needle, needle + f'exit {fail_code}\n', 1)
+        return stubs + source
+
+    def test_full_preparation_shell_success_with_stubbed_tools(self):
+        log = []
+        with self.linux_links(), patch.object(supervisor, 'decide', side_effect=lambda code,*_: (code,1)), \
+                patch.object(supervisor, 'supervise', side_effect=self.clean_mock_vm) as boot:
+            code, _ = supervisor.run_workflow(self.full_preparation_script(), str(ROOT), log)
+        self.assertEqual(code, 0, log)
+        self.assertIn('PREPARATION_EXIT_CODE=0', log)
+        self.assertIn('KVM_API_VERSION=12', log)
+        self.assertIn('VERIFIED_IMAGE_SHA256=' + '0'*64, log)
+        self.assertEqual(boot.call_count, 1)
+
+
+    def test_prepare_pipe_configuration_failure_closes_both_fds(self):
+        with patch.object(supervisor.os, 'pipe', return_value=(1001,1002)), \
+                patch.object(supervisor.os, 'set_blocking', side_effect=OSError(errno.EBADF)), \
+                patch.object(supervisor.os, 'close') as close, patch.object(supervisor, 'Child') as child:
+            outcome = supervisor.prepare_workspace(str(self.work), self.pinned, '', str(ROOT), [])
+        self.assertEqual(outcome.termination, 'not_started')
+        self.assertEqual({call.args[0] for call in close.call_args_list}, {1001,1002})
+        child.assert_not_called()
+
+    def test_cancellation_during_rollback_updates_policy_marker(self):
+        import signal
+        cleanup = supervisor.clean_work
+        def clean(*args):
+            result = cleanup(*args)
+            supervisor.cancel(signal.SIGINT, None)
+            return result
+        log = []
+        with self.linux_links(), patch.object(supervisor, 'cancelled', False), \
+                patch.object(supervisor, 'cancel_signal', None), \
+                patch.object(supervisor, 'clean_work', side_effect=clean):
+            code, _ = supervisor.run_workflow('exit 7', str(ROOT), log)
+        self.assertEqual(code, 130)
+        self.assertIn('PREPARATION_EXIT_CODE=7', log)
+        self.assertIn('PREPARATION_POLICY_CODE=130', log)
+        self.assertIn('PREPARATION_CANCELLED=yes', log)
+
+
 class WorkspaceMountInventory(unittest.TestCase):
     @staticmethod
     def mount(path):
@@ -940,6 +1377,25 @@ class WorkspaceMountInventory(unittest.TestCase):
         self.assertEqual(supervisor.mountinfo_point(self.mount(raw).rstrip(b'\n')), expected)
         workspace = os.fsdecode(expected.rsplit(b'/', 1)[0])
         self.check(self.mount(raw), work=workspace, reason='unexpected_workspace_mount')
+
+
+def stage_failure_test(stage, code):
+    def test(self):
+        self.check_preparation_diagnostics(self.diagnostic_trap() +
+            f"prep_stage={stage}; exit {code}", stage, code)
+    return test
+
+for _index, _stage in enumerate(sorted(supervisor.PREPARATION_STAGES), 31):
+    setattr(CleanupIdentity, "test_stage_failure_" + _stage, stage_failure_test(_stage, _index))
+
+
+def full_stage_failure_test(stage):
+    def test(self):
+        self.check_preparation_diagnostics(self.full_preparation_script(stage), stage, 47)
+    return test
+
+for _stage in sorted(supervisor.PREPARATION_STAGES):
+    setattr(CleanupIdentity, "test_full_shell_failure_" + _stage, full_stage_failure_test(_stage))
 
 
 if __name__ == '__main__':

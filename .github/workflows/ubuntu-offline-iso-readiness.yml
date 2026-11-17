@@ -23,13 +23,25 @@ jobs:
           exec python3 -B -E -s -u supervisor.py --prepare-and-run <<'PREPARE'
           set -euo pipefail
           umask 077
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
           work=$1
           bundle=$2
+          prep_stage=unknown
+          report_preparation_failure() {
+            local rc=$?
+            trap - EXIT
+            if (( rc != 0 )); then
+              python3 -B -E -s "$bundle/supervisor.py" --write-preparation-failure "$prep_stage" "$rc" </dev/null >/dev/null 2>&1 || :
+            fi
+            exit "$rc"
+          }
+          trap report_preparation_failure EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          prep_stage=disk_preflight
           free_kib=$(df -Pk . | awk 'NR == 2 {print $4}')
           [[ "$free_kib" =~ ^[0-9]+$ && "$free_kib" -ge 4194304 ]]
 
+          prep_stage=apt_update
           cat > ubuntu.list <<'APT'
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
@@ -37,17 +49,20 @@ jobs:
           APT
           apt_source=(-o "Dir::Etc::sourcelist=$work/ubuntu.list" -o Dir::Etc::sourceparts=-)
           sudo -n apt-get "${apt_source[@]}" -o APT::Update::Error-Mode=any update
-          packages=(qemu-system-x86 genisoimage ubuntu-keyring)
+          prep_stage=apt_install
+          packages=(qemu-system-x86 qemu-utils genisoimage ubuntu-keyring)
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]] && ! command -v setfacl >/dev/null; then
             packages+=(acl)
           fi
           sudo -n apt-get "${apt_source[@]}" install -y --no-install-recommends "${packages[@]}"
+          prep_stage=qemu_version
           qemu_output=$(qemu-system-x86_64 --version)
           qemu_first=${qemu_output%%$'\n'*}
           qemu_pattern='^QEMU emulator version ([0-9]{1,4}(\.[0-9]{1,4}){2}(-rc[0-9]{1,4})?)([[:blank:]]|$)'
           [[ "$qemu_first" =~ $qemu_pattern ]] || exit 1
           qemu_version=${BASH_REMATCH[1]}
 
+          prep_stage=kvm_access
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             sudo -n setfacl -m "u:$(id -u):rw" -- /dev/kvm
             echo KVM_ACL=applied
@@ -75,21 +90,27 @@ jobs:
             curl --fail --silent --show-error --proto '=https' \
               --connect-timeout 15 --max-time "$2" --output "$1" "$base/$1"
           }
+          prep_stage=image_download
           download SHA256SUMS 30
           download SHA256SUMS.gpg 30
+          prep_stage=image_signature
           mkdir -m 0700 gnupg
           gpgv --homedir "$work/gnupg" \
             --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg SHA256SUMS.gpg SHA256SUMS
+          prep_stage=image_hash
           awk -v image="$image" '
             NF==2 && ($2==image || $2=="*" image) &&
             length($1)==64 && $1 ~ /^[0-9a-f]+$/ { print $1 "  " image; count++ }
             END { if (count != 1) exit 1 }
           ' SHA256SUMS > image.sha256
+          prep_stage=image_download
           download "$image" 180
+          prep_stage=image_hash
           sha256sum --check --strict image.sha256
           image_hash=$(cut -d ' ' -f1 image.sha256)
           [[ "$image_hash" =~ ^[0-9a-f]{64}$ ]]
 
+          prep_stage=image_format
           mv -- "$image" guest.img
           python3 - <<'PY'
           import json
@@ -101,6 +122,7 @@ jobs:
               info.get('format-specific', {}).get('data', {}).get('data-file')):
               raise SystemExit(1)
           PY
+          prep_stage=iso_build
           media_hashes=$(PYTHONPATH="$bundle" python3 -B - "$bundle" <<'PY'
           from pathlib import Path
           import sys
@@ -110,6 +132,7 @@ jobs:
           )
           read -r iso_hash files_hash extra <<< "$media_hashes"
           [[ -z "$extra" && "$iso_hash" =~ ^[0-9a-f]{64}$ && "$files_hash" =~ ^[0-9a-f]{64}$ ]]
+          prep_stage=receipt_write
           printf 'QEMU_VERSION=%s\nKVM_API_VERSION=%s\nVERIFIED_IMAGE_SHA256=%s\nHOST_ISO_SHA256=%s\nHOST_FILE_MANIFEST_SHA256=%s\n' \
             "$qemu_version" "$kvm_api" "$image_hash" "$iso_hash" "$files_hash" > preparation.receipt
           PREPARE
