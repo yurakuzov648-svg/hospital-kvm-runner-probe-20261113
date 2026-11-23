@@ -30,7 +30,7 @@ def verify_serial(data, iso_hash, files_hash):
         return None
     index, line = candidates[0]
     if line != marker:
-        if re.fullmatch(rb'ISO_DIAG_FAIL (ENV|TOOLS|NETWORK|DEVICES|ISO|IDENTITY|SHUTDOWN)', line):
+        if re.fullmatch(rb'ISO_DIAG_FAIL (ENV|TOOLS|TOOLS_MISSING|TOOLS_VISUDO|ACL_BOOTSTRAP|NETWORK|DEVICES|ISO|IDENTITY|SHUTDOWN)', line):
             return line
         return None
     shutdowns = [i for i, value in enumerate(lines)

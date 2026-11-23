@@ -47,7 +47,9 @@ jobs:
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
           deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main universe
           APT
-          apt_source=(-o "Dir::Etc::sourcelist=$work/ubuntu.list" -o Dir::Etc::sourceparts=-)
+          apt_source=(-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=
+                      -o Acquire::AllowInsecureRepositories=false
+                      -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false -o "Dir::Etc::sourcelist=$work/ubuntu.list" -o Dir::Etc::sourceparts=-)
           sudo -n apt-get "${apt_source[@]}" -o APT::Update::Error-Mode=any update
           prep_stage=apt_install
           packages=(qemu-system-x86 qemu-utils genisoimage ubuntu-keyring)
@@ -55,6 +57,11 @@ jobs:
             packages+=(acl)
           fi
           sudo -n apt-get "${apt_source[@]}" install -y --no-install-recommends "${packages[@]}"
+          acl_version=$(PYTHONPATH="$bundle" python3 -B -c 'from build_iso import ACL_VERSION; print(ACL_VERSION)')
+          acl_spec="acl:amd64=$acl_version"
+          apt-cache "${apt_source[@]}" show "$acl_spec" > acl.apt-metadata
+          apt-get "${apt_source[@]}" download "$acl_spec"
+          mv -- "acl_${acl_version}_amd64.deb" acl.deb
           prep_stage=qemu_version
           qemu_output=$(qemu-system-x86_64 --version)
           qemu_first=${qemu_output%%$'\n'*}
@@ -84,7 +91,7 @@ jobs:
           )
           [[ "$kvm_api" == 12 ]]
 
-          base=https://cloud-images.ubuntu.com/releases/noble/release
+          base=https://cloud-images.ubuntu.com/releases/noble/release-20261017
           image=ubuntu-24.04-server-cloudimg-amd64.img
           download() {
             curl --fail --silent --show-error --proto '=https' \
@@ -104,6 +111,8 @@ jobs:
             END { if (count != 1) exit 1 }
           ' SHA256SUMS > image.sha256
           prep_stage=image_download
+          [[ $(cut -d ' ' -f1 image.sha256) == 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94 ]]
+          download ubuntu-24.04-server-cloudimg-amd64.manifest 30
           download "$image" 180
           prep_stage=image_hash
           sha256sum --check --strict image.sha256
@@ -126,8 +135,10 @@ jobs:
           media_hashes=$(PYTHONPATH="$bundle" python3 -B - "$bundle" <<'PY'
           from pathlib import Path
           import sys
-          from build_iso import build
-          print(*build(Path.cwd(), (Path(sys.argv[1]) / 'guest.sh').read_bytes()))
+          from build_iso import build, verified_acl
+          acl = verified_acl(Path('acl.apt-metadata').read_text(), Path('acl.deb'),
+                             manifest=Path('ubuntu-24.04-server-cloudimg-amd64.manifest').read_text())
+          print(*build(Path.cwd(), (Path(sys.argv[1]) / 'guest.sh').read_bytes(), acl))
           PY
           )
           read -r iso_hash files_hash extra <<< "$media_hashes"

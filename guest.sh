@@ -11,12 +11,6 @@ cd /
 [[ "$ID:$VERSION_ID:$(uname -m):$(id -u)" == ubuntu:24.04:x86_64:0 ]]
 [[ $(getconf _NPROCESSORS_ONLN) == 2 ]]
 
-stage=TOOLS
-for tool in bash python3 sudo visudo chown chgrp chmod stat find mount umount findmnt id getent groupadd groupdel useradd userdel runuser ip getfacl pgrep timeout lsblk sha256sum systemctl; do
-  command -v "$tool" >/dev/null
-done
-visudo -c
-
 stage=NETWORK
 links=$(ls -1 /sys/class/net)
 routes4=$(ip -4 route show table all)
@@ -80,10 +74,10 @@ options=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS --mountpoint "$media")
 read -r source fstype flags <<< "$options"
 [[ $source == /dev/sr0 && $fstype == iso9660 ]]
 for flag in ro nodev nosuid noexec; do [[ ,$flags, == *",$flag,"* ]]; done
-[[ $(ls -1A "$media") == $'meta-data\nnetwork-config\nneutral.txt\nuser-data' ]]
+[[ $(ls -1A "$media") == $'acl.deb\nmeta-data\nnetwork-config\nneutral.txt\nuser-data' ]]
 iso_hash=$(sha256sum /dev/sr0)
 iso_hash=${iso_hash%% *}
-manifest() { (cd "$media" && sha256sum meta-data network-config neutral.txt user-data); }
+manifest() { (cd "$media" && sha256sum acl.deb meta-data network-config neutral.txt user-data); }
 files=$(manifest)
 files_hash=$(printf '%s\n' "$files" | sha256sum)
 files_hash=${files_hash%% *}
@@ -94,7 +88,7 @@ import sys
 
 fd = os.open(sys.argv[1], os.O_DIRECTORY | os.O_NOFOLLOW)
 # No truncation even if misconfigured. The disposable probe must be absent.
-for name, flags in [('neutral.txt', os.O_WRONLY),
+for name, flags in [('neutral.txt', os.O_WRONLY), ('acl.deb', os.O_WRONLY),
                     ('unexpected-write-probe', os.O_WRONLY | os.O_CREAT | os.O_EXCL)]:
     try:
         handle = os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=fd)
@@ -107,8 +101,64 @@ for name, flags in [('neutral.txt', os.O_WRONLY),
 os.close(fd)
 PY
 [[ $(manifest) == "$files" ]]
+stage=ACL_BOOTSTRAP
+command -v dpkg >/dev/null || exit 1
+command -v dpkg-query >/dev/null || exit 1
+command -v dpkg-deb >/dev/null || exit 1
+acl_version='@ACL_VERSION@'
+acl_hash='@ACL_SHA256@'
+acl="$media/acl.deb"
+[[ "$acl_hash" =~ ^[0-9a-f]{64}$ && -f "$acl" && ! -L "$acl" ]] || exit 1
+actual=$(sha256sum "$acl") || exit 1
+[[ ${actual%% *} == "$acl_hash" ]] || exit 1
+guest_arch=$(dpkg --print-architecture) || exit 1
+package_name=$(dpkg-deb -f "$acl" Package) || exit 1
+package_arch=$(dpkg-deb -f "$acl" Architecture) || exit 1
+package_version=$(dpkg-deb -f "$acl" Version) || exit 1
+libacl_status=$(dpkg-query -W -f='${Status} ${Version}' libacl1:amd64) || exit 1
+[[ "$guest_arch" == amd64 && "$package_name" == acl && "$package_arch" == amd64 &&
+   "$package_version" == "$acl_version" && "$libacl_status" == "install ok installed $acl_version" ]] || exit 1
+python3 -I - "$acl" <<'PYDEP'
+import re
+import subprocess
+import sys
+@DEPENDENCY_CHECK@
+
+def installed(name):
+    result = subprocess.run(
+        ['dpkg-query', '-W', '-f=${Status} ${Architecture} ${Version}', name + ':amd64'],
+        capture_output=True, text=True, timeout=10)
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise SystemExit(1)
+    match = re.fullmatch(r'install ok installed (amd64|all) (\S+)', result.stdout)
+    return match[2] if match else None
+
+def compare(version, operator, required):
+    result = subprocess.run(['dpkg', '--compare-versions', version, operator, required], timeout=10)
+    if result.returncode not in (0, 1):
+        raise SystemExit(1)
+    return result.returncode == 0
+
+for field in ('Depends', 'Pre-Depends'):
+    expression = subprocess.check_output(['dpkg-deb', '-f', sys.argv[1], field], text=True, timeout=10)
+    check_dependencies(expression, installed, compare)
+PYDEP
+dpkg --install -- "$acl" || exit 1
+command -v getfacl >/dev/null || exit 1
+getfacl -cp -- /run >/dev/null || exit 1
+
+stage=ISO
 umount "$media"
 rmdir -- "$media"
+
+stage=TOOLS_MISSING
+for tool in bash python3 sudo visudo chown chgrp chmod stat find mount umount findmnt id getent groupadd groupdel useradd userdel runuser ip getfacl pgrep timeout lsblk sha256sum systemctl; do
+  command -v "$tool" >/dev/null || exit 1
+done
+stage=TOOLS_VISUDO
+visudo -c || exit 1
 
 stage=IDENTITY
 [[ $(getent -s files passwd 65534) == nobody:*:65534:* ]]

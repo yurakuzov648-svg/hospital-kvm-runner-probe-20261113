@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from build_iso import FILES, build, contents, sha
+from build_iso import ACL_VERSION, FILES, build, contents, sha, verified_acl
 from isolation import qemu_args, verify_launch, verify_serial
 import supervisor
 
@@ -54,6 +54,133 @@ class Readiness(unittest.TestCase):
             with self.subTest(option=option), self.assertRaises(ValueError):
                 verify_launch(argv + [option, 'unexpected'])
 
+    def test_tools_guest_checks_and_serial_distinguish_fixed_failures(self):
+        guest = (ROOT / 'guest.sh').read_text()
+        trap = next(line for line in guest.splitlines() if line.endswith("' EXIT"))
+        tools = guest[guest.index('stage=TOOLS_MISSING'):guest.index('stage=IDENTITY')]
+        script = (
+            'exec 3>&1; exec >/dev/null 2>&1\n'
+            'systemctl() { :; }\n'
+            'command() { [[ "$2" != "$_MISSING" ]]; }\n'
+            'visudo() { echo SYNTHETIC_RAW >&2; return "$VISUDO_RC"; }\n'
+        ) + trap + '\n' + tools
+        for missing, visudo_rc, expected in (
+            ('getfacl', '0', b'ISO_DIAG_FAIL TOOLS_MISSING'),
+            ('', '1', b'ISO_DIAG_FAIL TOOLS_VISUDO'),
+            ('', '0', None),
+        ):
+            with self.subTest(missing=missing, visudo_rc=visudo_rc):
+                result = subprocess.run(
+                    ['bash', '-c', script], env={**os.environ, '_MISSING': missing, 'VISUDO_RC': visudo_rc},
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, int(expected is not None))
+                self.assertEqual(result.stdout, expected + b'\n' if expected else b'')
+                self.assertEqual(result.stderr, b'')
+                if expected:
+                    self.assertEqual(verify_serial(result.stdout, ISO, FILES_HASH), expected)
+                    self.assertIsNone(verify_serial(expected + b' injected\n', ISO, FILES_HASH))
+
+    def test_full_dependency_relations_and_alternatives(self):
+        from build_iso import check_dependencies
+        installed = {'libacl1': ACL_VERSION, 'libc6': '2.39'}
+        compare = lambda version, operator, required: {
+            '=': version == required, '>=': version >= required,
+            '>>': version > required, '<<': version < required, '<=': version <= required,
+        }[operator]
+        check_dependencies(f'missing | libacl1 (= {ACL_VERSION}), libc6 (>= 2.38)', installed.get, compare)
+        for text in ('missing', 'libc6 (>= 9)', 'libc6 | missing, absent',
+                     'libc6 [amd64]', 'libc6,', 'libacl1 (= 0)'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                check_dependencies(text, installed.get, compare)
+        check_dependencies('libc6:amd64 (>> 2.38)', installed.get, compare)
+
+    def test_verified_acl_metadata_and_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / 'acl.deb'
+            data = b'synthetic deb'
+            package.write_bytes(data)
+            fields = {'Package': 'acl', 'Version': ACL_VERSION, 'Architecture': 'amd64',
+                      'SHA256': sha(data), 'Depends': f'libacl1 (= {ACL_VERSION}), libc6 (>= 2.38)'}
+            metadata = ''.join(f'{k}: {v}\n' for k, v in fields.items())
+
+            def invoke(args, **kwargs):
+                if args[0] == 'dpkg':
+                    return b''
+                return fields.get(args[-1], '').encode() + b'\n'
+
+            self.assertEqual(verified_acl(metadata, package, invoke, manifest=f'libacl1:amd64 {ACL_VERSION}\nlibc6:amd64 2.39\n'), data)
+            for bad in (metadata.replace(ACL_VERSION, '0.0'), metadata.replace(sha(data), '0' * 64),
+                        metadata.replace('amd64', 'arm64'), metadata + 'Package: acl\n'):
+                with self.subTest(metadata=bad), self.assertRaises(ValueError):
+                    verified_acl(bad, package, invoke, manifest='')
+            with self.assertRaises(subprocess.CalledProcessError):
+                verified_acl(metadata, package, lambda *a, **kw: subprocess.check_output(
+                    ['/usr/bin/false'], stderr=subprocess.DEVNULL))
+            fields['Depends'] = 'libacl1 (= 0.0)'
+            with self.assertRaises(ValueError):
+                verified_acl(metadata, package, invoke, manifest=f'libacl1:amd64 {ACL_VERSION}\nlibc6:amd64 2.39\n')
+
+    def test_guest_acl_bootstrap_success_and_failures(self):
+        guest = (ROOT / 'guest.sh').read_text()
+        block = guest.split('stage=ACL_BOOTSTRAP\n', 1)[1].split('\nstage=ISO', 1)[0]
+        data = b'synthetic deb'
+        block = block.replace('@ACL_VERSION@', ACL_VERSION).replace('@ACL_SHA256@', sha(data))
+        block = block.replace('@DEPENDENCY_CHECK@', 'pass')
+        trap = next(line for line in guest.splitlines() if line.endswith("' EXIT"))
+        stubs = """
+set -e
+exec 3>&1
+exec >/dev/null 2>&1
+stage=ACL_BOOTSTRAP
+media=$1
+systemctl() { :; }
+python3() { cat >/dev/null; return 0; }
+command() { [[ "$2" != "$MISSING" ]]; }
+sha256sum() { printf '%s  fixture\\n' "$HASH"; }
+dpkg() {
+  if [[ $1 == --print-architecture ]]; then printf 'amd64\\n'; return; fi
+  [[ "$1 $2" == '--install --' ]] || exit 99
+  : > "$media/installed"
+  return "$INSTALL_RC"
+}
+dpkg-deb() {
+  case "$3" in
+    Package) printf 'acl\\n';;
+    Architecture) printf 'amd64\\n';;
+    Version) printf '%s\\n' "$VERSION";;
+    *) return 99;;
+  esac
+}
+dpkg-query() { printf 'install ok installed %s\\n' "$LIB_VERSION"; return "$QUERY_RC"; }
+getfacl() { return "$ACL_RC"; }
+"""
+        for delta, install_called, rc in (
+            ({}, True, 0),
+            ({'LIB_VERSION': '0.0'}, False, 1),
+            ({'QUERY_RC': '1'}, False, 1),
+            ({'VERSION': '0.0'}, False, 1),
+            ({'HASH': '0' * 64}, False, 1),
+            ({'MISSING': 'dpkg'}, False, 1),
+            ({'INSTALL_RC': '1'}, True, 1),
+            ({'MISSING': 'getfacl'}, True, 1),
+            ({'ACL_RC': '1'}, True, 1),
+        ):
+            with self.subTest(delta=delta), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / 'acl.deb').write_bytes(data)
+                env = dict(os.environ, HASH=sha(data), VERSION=ACL_VERSION, LIB_VERSION=ACL_VERSION,
+                           MISSING='', INSTALL_RC='0', ACL_RC='0', QUERY_RC='0')
+                env.update(delta)
+                result = subprocess.run(['bash', '-c', stubs + trap + '\n' + block, 'fixture', tmp],
+                                        env=env, capture_output=True)
+                self.assertEqual(result.returncode, rc)
+                self.assertEqual((Path(tmp) / 'installed').exists(), install_called)
+                self.assertEqual(result.stdout, b'ISO_DIAG_FAIL ACL_BOOTSTRAP\n' if rc else b'')
+                self.assertEqual(result.stderr, b'')
+        marker = b'ISO_DIAG_FAIL ACL_BOOTSTRAP'
+        self.assertEqual(verify_serial(marker, ISO, FILES_HASH), marker)
+        self.assertIsNone(verify_serial(marker + b' arbitrary', ISO, FILES_HASH))
+
     def test_serial_positive(self):
         self.assertEqual(verify_serial(b'ignored\r\n' + MARKER + b'\r\n' + DOWN,
                                        ISO, FILES_HASH), MARKER)
@@ -70,7 +197,7 @@ class Readiness(unittest.TestCase):
         self.assertEqual(verify_serial(b'ISO_DIAG_FAIL ISO', ISO, FILES_HASH), b'ISO_DIAG_FAIL ISO')
 
     def test_iso_creation_and_rejection(self):
-        payload = contents(b'guest stub\n')
+        payload = contents(b'guest stub\n', b'fake acl')
         for defect in (None, 'extra', 'tampered', 'unaligned'):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
@@ -88,9 +215,9 @@ class Readiness(unittest.TestCase):
 
                 if defect:
                     with self.assertRaises(ValueError):
-                        build(work, b'guest stub\n', fake)
+                        build(work, b'guest stub\n', b'fake acl', fake)
                 else:
-                    iso, manifest = build(work, b'guest stub\n', fake)
+                    iso, manifest = build(work, b'guest stub\n', b'fake acl', fake)
                     self.assertEqual(iso, sha(b'i' * 2048))
                     self.assertRegex(manifest, r'^[a-f0-9]{64}$')
                     self.assertEqual((work / 'seed.iso').stat().st_mode & 0o777, 0o400)
@@ -1198,6 +1325,8 @@ class CleanupIdentity(unittest.TestCase):
         stubs = r'''
 df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 9999999 0 9999999 0%% .\n'; }
 sudo() { return 0; }
+apt-cache() { printf 'fixture metadata\n'; }
+apt-get() { printf fixture > acl_2.3.2-1build1.1_amd64.deb; }
 qemu-system-x86_64() { printf 'QEMU emulator version 8.2.2 (fixture)\n'; }
 curl() {
   local out=
@@ -1206,7 +1335,7 @@ curl() {
     shift
   done
   if [[ $out == SHA256SUMS ]]; then
-    printf '%064d  ubuntu-24.04-server-cloudimg-amd64.img\n' 0 > "$out"
+    printf '04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94  ubuntu-24.04-server-cloudimg-amd64.img\n' > "$out"
   else
     printf fixture > "$out"
   fi
@@ -1214,7 +1343,7 @@ curl() {
 gpgv() { return 0; }
 sha256sum() { return 0; }
 python3() {
-  if [[ $* == *--write-preparation-failure* ]]; then command python3 "$@"; return $?; fi
+  if [[ $* == *--write-preparation-failure* || $* == *ACL_VERSION* ]]; then command python3 "$@"; return $?; fi
   cat >/dev/null
   case "$prep_stage" in
     kvm_access) printf '12\n' ;;
@@ -1230,6 +1359,62 @@ python3() {
             source = source.replace(needle, needle + f'exit {fail_code}\n', 1)
         return stubs + source
 
+    def test_acl_apt_cache_and_download_failures(self):
+        cases = [
+            ('apt-cache() { return 42; }', 42),
+            ('apt-get() { return 43; }', 43),
+            ('apt-get() { return 0; }', 1),
+        ]
+        for stub, expected in cases:
+            with self.subTest(stub=stub), self.linux_links(), patch.object(supervisor, 'supervise') as boot:
+                script = self.full_preparation_script()
+                location = script.index('set -euo pipefail')
+                script = script[:location] + stub + '\n' + script[location:]
+                log = []
+                code, _ = supervisor.run_workflow(script, str(ROOT), log)
+                self.assertEqual(code, expected, log)
+                self.assertIn('PREPARATION_ROLLBACK=confirmed', log)
+                boot.assert_not_called()
+
+    def test_dependency_metadata_incomplete_duplicate_and_predepends(self):
+        from build_iso import verified_acl
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / 'acl.deb'
+            package.write_bytes(b'fixture')
+            fields = {'Package': 'acl', 'Architecture': 'amd64', 'Version': ACL_VERSION,
+                      'SHA256': sha(b'fixture'), 'Depends': f'libacl1 (= {ACL_VERSION})',
+                      'Pre-Depends': 'libc6 (>= 2.38)'}
+            text = ''.join(f'{k}: {v}\n' for k,v in fields.items())
+            manifest = f'libacl1:amd64 {ACL_VERSION}\nlibc6:amd64 2.39\n'
+
+            def invoke(args, **kwargs):
+                if args[0] == 'dpkg':
+                    return b''
+                return fields.get(args[-1], '').encode() + b'\n'
+
+            self.assertEqual(verified_acl(text, package, invoke, manifest), b'fixture')
+            for bad in ('', text.replace('SHA256:', 'Unknown:'),
+                        text + text, text + 'SHA256: ' + '0'*64 + '\n'):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    verified_acl(bad, package, invoke, manifest)
+            with self.assertRaises(ValueError):
+                verified_acl(text, package, invoke, f'libacl1:amd64 {ACL_VERSION}\n')
+            fields['Pre-Depends'] = 'absent'
+            with self.assertRaises(ValueError):
+                verified_acl(text, package, invoke, manifest)
+
+    def test_unauthenticated_apt_indexes_stop_before_acl_download(self):
+        script = self.full_preparation_script().replace('sudo() { return 0; }', 'sudo() { return 100; }')
+        download_called = self.parent / 'unexpected-deb-download'
+        script = script.replace('apt-get() {', f'apt-get() {{ touch "{download_called}";')
+        log = []
+        with self.linux_links(), patch.object(supervisor, 'supervise') as boot:
+            code, _ = supervisor.run_workflow(script, str(ROOT), log)
+        self.assertEqual(code, 100, log)
+        self.assertTrue(any('PREP_STAGE=apt_update' in item for item in log), log)
+        self.assertFalse(download_called.exists())
+        boot.assert_not_called()
+
     def test_full_preparation_shell_success_with_stubbed_tools(self):
         log = []
         with self.linux_links(), patch.object(supervisor, 'decide', side_effect=lambda code,*_: (code,1)), \
@@ -1238,7 +1423,7 @@ python3() {
         self.assertEqual(code, 0, log)
         self.assertIn('PREPARATION_EXIT_CODE=0', log)
         self.assertIn('KVM_API_VERSION=12', log)
-        self.assertIn('VERIFIED_IMAGE_SHA256=' + '0'*64, log)
+        self.assertIn('VERIFIED_IMAGE_SHA256=04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94', log)
         self.assertEqual(boot.call_count, 1)
 
 
